@@ -6,12 +6,20 @@
   "type": "module",
   "private": true,
   "bin": {
-    "openproject-mcp": "index.ts"
+    "openproject-mcp": "index.ts",
+    "openproject-mcp-http": "http-server.ts"
   },
   "scripts": {
     "start": "bun run index.ts",
+    "start:stdio": "bun run index.ts",
+    "start:http": "bun run http-server.ts",
     "dev": "bun run --watch index.ts",
-    "inspect": "bunx @modelcontextprotocol/inspector bun run index.ts"
+    "dev:http": "bun run --watch http-server.ts",
+    "inspect": "bunx @modelcontextprotocol/inspector bun run index.ts",
+    "inspect:http": "bunx @modelcontextprotocol/inspector --transport http --url http://localhost:3100/mcp",
+    "test": "bun test",
+    "test:http": "bun test tests/mcp-server.test.ts",
+    "test:comparison": "bun test tests/transport-comparison.test.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

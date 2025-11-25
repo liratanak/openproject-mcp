@@ -1078,16 +1078,159 @@ bunx @modelcontextprotocol/inspector bun run index.ts
 
 ---
 
+### HTTP Transport (Remote/Web Clients)
+
+The MCP server supports HTTP transport using the Streamable HTTP protocol, enabling remote connections from web-based clients or distributed systems.
+
+#### Starting the HTTP Server
+
+```bash
+# Start the HTTP server (default port 3100)
+bun run start:http
+
+# Or with custom port
+MCP_HTTP_PORT=8080 bun run start:http
+
+# Development mode with hot reload
+bun run dev:http
+```
+
+#### Environment Variables
+
+```bash
+# Required
+OPENPROJECT_URL=https://your-instance.openproject.com
+OPENPROJECT_API_KEY=your-api-key-here
+
+# Optional
+MCP_HTTP_PORT=3100        # HTTP server port (default: 3100)
+MCP_HTTP_HOST=0.0.0.0     # HTTP server host (default: 0.0.0.0)
+OPENPROJECT_TIMEOUT=30000 # Request timeout in milliseconds
+```
+
+#### HTTP Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | POST | Handle MCP JSON-RPC requests |
+| `/mcp` | GET | Get session status |
+| `/mcp` | DELETE | Close a session |
+| `/health` | GET | Health check endpoint |
+
+#### Testing the HTTP Server
+
+Use curl to verify the server is running:
+
+```bash
+# Health check
+curl http://localhost:3100/health
+# Response: {"status":"ok","transport":"http"}
+
+# Initialize a session
+curl -X POST http://localhost:3100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2024-11-05",
+      "capabilities": {},
+      "clientInfo": {"name": "test", "version": "1.0.0"}
+    }
+  }'
+```
+
+#### Programmatic HTTP Client Integration
+
+```typescript
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+// Connect via HTTP
+const transport = new StreamableHTTPClientTransport(
+  new URL('http://localhost:3100/mcp')
+);
+
+const client = new Client({
+  name: 'my-http-client',
+  version: '1.0.0',
+});
+
+await client.connect(transport);
+
+// List available tools
+const tools = await client.listTools();
+console.log('Available tools:', tools.tools.map(t => t.name));
+
+// Call a tool
+const result = await client.callTool({
+  name: 'get_current_user',
+  arguments: {},
+});
+console.log('Current user:', result.content);
+
+// Close the connection
+await client.close();
+```
+
+#### MCP Inspector with HTTP Transport
+
+```bash
+# Inspect the HTTP server
+bun run inspect:http
+
+# Or manually
+bunx @modelcontextprotocol/inspector --transport http --url http://localhost:3100/mcp
+```
+
+#### Deploying the HTTP Server
+
+For production deployments:
+
+1. **Using a process manager (PM2)**:
+   ```bash
+   pm2 start "bun run start:http" --name openproject-mcp
+   ```
+
+2. **Using Docker**:
+   ```dockerfile
+   FROM oven/bun:1
+   WORKDIR /app
+   COPY . .
+   RUN bun install
+   ENV MCP_HTTP_PORT=3100
+   EXPOSE 3100
+   CMD ["bun", "run", "start:http"]
+   ```
+
+3. **Behind a reverse proxy (nginx)**:
+   ```nginx
+   location /mcp {
+       proxy_pass http://localhost:3100;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection 'upgrade';
+       proxy_set_header Host $host;
+       proxy_cache_bypass $http_upgrade;
+   }
+   ```
+
+---
+
 ### Custom MCP Clients
 
-To integrate with any MCP-compatible client:
+The server supports two transport mechanisms:
 
-1. **Protocol**: The server uses stdio transport (standard input/output)
+#### Option 1: STDIO Transport (Local/Subprocess)
+
+Best for local development and desktop applications that spawn the server as a subprocess.
+
+1. **Protocol**: Standard input/output streams
 2. **Command**: `bun run /path/to/tonle/index.ts`
 3. **Environment Variables**: Pass `OPENPROJECT_URL` and `OPENPROJECT_API_KEY`
 4. **Protocol Version**: MCP SDK version 1.22.0
-
-Example programmatic integration:
 
 ```typescript
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -1105,8 +1248,32 @@ const transport = new StdioClientTransport({
 const client = new Client({
   name: 'my-mcp-client',
   version: '1.0.0',
-}, {
-  capabilities: {}
+});
+
+await client.connect(transport);
+const tools = await client.listTools();
+```
+
+#### Option 2: HTTP Transport (Remote/Web)
+
+Best for web applications, remote clients, or microservice architectures.
+
+1. **Protocol**: Streamable HTTP (JSON-RPC over HTTP with SSE)
+2. **URL**: `http://your-server:3100/mcp`
+3. **Environment Variables**: Set on the server side
+4. **Protocol Version**: MCP SDK version 1.22.0
+
+```typescript
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+const transport = new StreamableHTTPClientTransport(
+  new URL('http://your-server:3100/mcp')
+);
+
+const client = new Client({
+  name: 'my-http-client',
+  version: '1.0.0',
 });
 
 await client.connect(transport);

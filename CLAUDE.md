@@ -11,16 +11,34 @@ This is the **Tonle OpenProject MCP Server** - a Model Context Protocol (MCP) se
 ### Running the Server
 
 ```bash
-# Start the server with Bun
+# Start STDIO server (for local MCP clients like Claude Desktop)
+bun run start
+# or
 bun run index.ts
 
+# Start HTTP server (for remote/web clients)
+bun run start:http
+
 # Development mode with auto-reload
-bun run dev
+bun run dev          # STDIO transport
+bun run dev:http     # HTTP transport
 
 # Test with MCP Inspector
-bun run inspect
-# or
-bunx @modelcontextprotocol/inspector bun run index.ts
+bun run inspect      # Inspect STDIO server
+bun run inspect:http # Inspect HTTP server
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+bun test
+
+# Run HTTP transport tests only
+bun test tests/mcp-server.test.ts
+
+# Run transport comparison tests
+bun test tests/transport-comparison.test.ts
 ```
 
 ### Package Management
@@ -37,13 +55,23 @@ bun update
 
 ### Core Components
 
-1. **index.ts** - Main MCP server entry point
+1. **index.ts** - STDIO MCP server entry point
+   - Uses shared server setup from `src/server-setup.ts`
+   - Implements stdio transport for local integration (Claude Desktop, Cursor)
+   - Best for spawning server as subprocess
+
+2. **http-server.ts** - HTTP MCP server entry point
+   - Uses shared server setup from `src/server-setup.ts`
+   - Implements Streamable HTTP transport for remote clients
+   - Supports session management with UUID-based sessions
+   - Endpoints: `/mcp` (POST/GET/DELETE), `/health` (GET)
+
+3. **src/server-setup.ts** - Shared MCP server configuration
    - Registers all MCP tools using `@modelcontextprotocol/sdk`
-   - Implements stdio transport for local integration
    - Tool handlers transform user-friendly parameters into API calls
    - Each tool follows pattern: validate input → call client → format response
 
-2. **src/openproject-client.ts** - OpenProject API client
+4. **src/openproject-client.ts** - OpenProject API client
    - Type-safe wrapper around OpenProject API v3
    - HAL+JSON format handling
    - Authentication via Basic Auth with API key
@@ -52,13 +80,15 @@ bun update
 ### Data Flow
 
 ```
-MCP Client (Claude, Cursor, etc.)
-    ↓ JSON-RPC over stdio
-MCP Server (index.ts)
-    ↓ Tool registration & handlers
-OpenProject Client (src/openproject-client.ts)
-    ↓ HTTPS with HAL+JSON
-OpenProject Instance (API v3)
+MCP Client (Claude, Cursor, etc.)          Web Client / Remote App
+    ↓ JSON-RPC over stdio                       ↓ JSON-RPC over HTTP
+MCP Server (index.ts)                      HTTP Server (http-server.ts)
+    ↓                                           ↓
+    └─────────── Server Setup (src/server-setup.ts) ───────────┘
+                            ↓ Tool registration & handlers
+                OpenProject Client (src/openproject-client.ts)
+                            ↓ HTTPS with HAL+JSON
+                        OpenProject Instance (API v3)
 ```
 
 ### Key Architecture Patterns
@@ -79,7 +109,12 @@ Required for the server to connect to OpenProject:
 - `OPENPROJECT_API_KEY` or `OPENPROJECT_TOKEN` - API key for authentication
 - `OPENPROJECT_TIMEOUT` - Request timeout in milliseconds (default: 30000)
 
-### Claude Desktop Integration
+HTTP server specific (optional):
+
+- `MCP_HTTP_PORT` - HTTP server port (default: 3100)
+- `MCP_HTTP_HOST` - HTTP server host (default: 0.0.0.0)
+
+### Claude Desktop Integration (STDIO)
 
 Add to `~/.config/Claude/claude_desktop_config.json`:
 
@@ -96,6 +131,29 @@ Add to `~/.config/Claude/claude_desktop_config.json`:
     }
   }
 }
+```
+
+### HTTP Client Integration
+
+For remote/web clients, start the HTTP server:
+
+```bash
+OPENPROJECT_URL=https://your-instance.openproject.com \
+OPENPROJECT_API_KEY=your-api-key \
+bun run start:http
+```
+
+Then connect using the MCP SDK's HTTP transport:
+
+```typescript
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+const transport = new StreamableHTTPClientTransport(
+  new URL('http://localhost:3100/mcp')
+);
+const client = new Client({ name: 'my-client', version: '1.0.0' });
+await client.connect(transport);
 ```
 
 ## Implementing New Tools
