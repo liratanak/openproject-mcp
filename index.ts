@@ -27,6 +27,37 @@ function createLink(type: string, id: number | string): string {
   return `/api/v3/${type}/${id}`;
 }
 
+async function resolveProjectId(projectRef: number | string): Promise<number> {
+  if (typeof projectRef === 'number') {
+    return projectRef;
+  }
+
+  const numericId = Number(projectRef);
+  if (!Number.isNaN(numericId)) {
+    return numericId;
+  }
+
+  const project = await client.getProject(projectRef);
+  return project.id;
+}
+
+function buildProjectMembershipFilter(projectId: number): string {
+  return JSON.stringify([
+    {
+      project: {
+        operator: '=',
+        values: [String(projectId)],
+      },
+    },
+  ]);
+}
+
+function extractResourceId(href: string, resource: string): number | null {
+  const regex = new RegExp(`/${resource}/(\\d+)(?:/|$)`);
+  const match = href.match(regex);
+  return match ? Number(match[1]) : null;
+}
+
 // ============== Root & Configuration Tools ==============
 
 server.tool(
@@ -500,6 +531,83 @@ server.tool(
     try {
       const result = await client.unlockUser(id);
       return { content: [{ type: 'text', text: formatResponse(result) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// ============== Membership Tools ==============
+
+server.tool(
+  'list_memberships',
+  'List project memberships (users/groups assigned to projects)',
+  {
+    offset: z.number().optional().describe('Page offset for pagination'),
+    pageSize: z.number().optional().describe('Number of items per page'),
+    filters: z.string().optional().describe('JSON filter expression'),
+    sortBy: z.string().optional().describe('Sort criteria as JSON array'),
+  },
+  async (params) => {
+    try {
+      const result = await client.listMemberships(params);
+      return { content: [{ type: 'text', text: formatResponse(result) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'list_project_members',
+  'List members who belong to a specific project',
+  {
+    projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
+    offset: z.number().optional().describe('Page offset for pagination'),
+    pageSize: z.number().optional().describe('Number of items per page'),
+  },
+  async ({ projectId, offset, pageSize }) => {
+    try {
+      const resolvedProjectId = await resolveProjectId(projectId);
+      const filters = buildProjectMembershipFilter(resolvedProjectId);
+      const result = await client.listMemberships({ offset, pageSize, filters });
+      return { content: [{ type: 'text', text: formatResponse(result) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'list_work_package_members',
+  'List members of the project that owns a work package',
+  {
+    workPackageId: z.number().describe('Work package ID'),
+    offset: z.number().optional().describe('Page offset for pagination'),
+    pageSize: z.number().optional().describe('Number of items per page'),
+  },
+  async ({ workPackageId, offset, pageSize }) => {
+    try {
+      const workPackage = await client.getWorkPackage(workPackageId);
+      const projectHref = workPackage._links?.project?.href;
+      if (!projectHref) {
+        throw new Error(`Work package ${workPackageId} does not reference a project.`);
+      }
+
+      const projectId = extractResourceId(projectHref, 'projects');
+      if (projectId === null) {
+        throw new Error(`Unable to extract project ID from link: ${projectHref}`);
+      }
+
+      const filters = buildProjectMembershipFilter(projectId);
+      const memberships = await client.listMemberships({ offset, pageSize, filters });
+      const response = {
+        workPackageId,
+        projectId,
+        projectHref,
+        memberships,
+      };
+      return { content: [{ type: 'text', text: formatResponse(response) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
     }

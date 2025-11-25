@@ -98,6 +98,32 @@ export interface Priority {
   _links: Record<string, { href: string; title?: string }>;
 }
 
+export interface MembershipRole {
+  id: number;
+  name: string;
+  _links: Record<string, { href: string; title?: string }>;
+}
+
+export interface MembershipPrincipal {
+  id: number;
+  name: string;
+  _type: string;
+  [key: string]: unknown;
+}
+
+export interface Membership {
+  id: number;
+  _type: 'Membership';
+  createdAt: string;
+  updatedAt: string;
+  _embedded?: {
+    project?: Project;
+    principal?: MembershipPrincipal;
+    roles?: MembershipRole[];
+  };
+  _links: Record<string, { href: string; title?: string }>;
+}
+
 export interface TimeEntry {
   id: number;
   comment?: { format: string; raw: string; html: string };
@@ -550,6 +576,17 @@ export class OpenProjectClient {
     filters?: string;
   }): Promise<HALResponse> {
     return this.request('GET', '/principals', undefined, params);
+  }
+
+  // ============== Memberships ==============
+
+  async listMemberships(params?: {
+    offset?: number;
+    pageSize?: number;
+    filters?: string;
+    sortBy?: string;
+  }): Promise<HALResponse<Membership>> {
+    return this.request('GET', '/memberships', undefined, params);
   }
 }
 

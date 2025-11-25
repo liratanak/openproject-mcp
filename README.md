@@ -266,6 +266,8 @@ Projects are containers that organize work packages, members, and other resource
 | Tool Name | HTTP Method | Endpoint | Description |
 |-----------|-------------|----------|-------------|
 | `list_memberships` | GET | `/api/v3/memberships` | List all memberships |
+| `list_project_members` | GET | `/api/v3/memberships?filters=[{"project":{"operator":"=","values":["{projectId}"]}}]` | List members within a project |
+| `list_work_package_members` | GET | `/api/v3/memberships?filters=[{"project":{"operator":"=","values":["project_of_work_package"]}}]` | List members of the project owning a work package |
 | `get_membership` | GET | `/api/v3/memberships/{id}` | Get a single membership |
 | `create_membership` | POST | `/api/v3/memberships` | Create a membership |
 | `update_membership` | PATCH | `/api/v3/memberships/{id}` | Update a membership |
@@ -913,6 +915,71 @@ Edit or create the `claude_desktop_config.json` file:
 3. Click it to see available MCP servers
 4. You should see "openproject" listed with available tools
 5. Try asking: "List all my OpenProject projects"
+
+---
+
+### Claude Code (CLI)
+
+Claude Code is Anthropic's official command-line interface with built-in MCP support.
+
+#### Installation
+
+```bash
+# Install Claude Code CLI globally
+npm install -g @anthropic-ai/claude-code
+```
+
+#### Configuration Location
+
+- **macOS**: `~/.config/claude-code/config.json`
+- **Windows**: `%APPDATA%\claude-code\config.json`
+- **Linux**: `~/.config/claude-code/config.json`
+
+#### Configuration
+
+Edit or create the `config.json` file:
+
+```json
+{
+  "mcpServers": {
+    "openproject": {
+      "command": "bun",
+      "args": ["run", "/absolute/path/to/tonle/index.ts"],
+      "env": {
+        "OPENPROJECT_URL": "https://your-instance.openproject.com",
+        "OPENPROJECT_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+#### Usage
+
+After configuration, start Claude Code:
+
+```bash
+# Start Claude Code
+claude-code
+
+# Or start in a specific directory
+claude-code /path/to/your/project
+```
+
+The OpenProject MCP server will automatically connect when you start Claude Code.
+
+#### Verification
+
+1. Start Claude Code CLI
+2. Check for connection messages in the terminal
+3. Try asking: "List all OpenProject tools available"
+4. Test with: "Show me my OpenProject projects"
+
+#### Tips
+
+- Use `claude-code --help` to see all available options
+- Check logs with `claude-code --verbose` for debugging
+- The CLI respects the same configuration format as Claude Desktop
 
 ---
 
