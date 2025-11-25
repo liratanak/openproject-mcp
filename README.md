@@ -1219,6 +1219,66 @@ For production deployments:
 
 ---
 
+### Configuring MCP Clients to Use HTTP Transport
+
+Many MCP clients (IDEs, CLIs, or custom applications) can connect to a remote MCP server over HTTP instead of spawning it via stdio.
+
+- **1. Start the HTTP server**: Run `bun run start:http` (or `MCP_HTTP_PORT=3100 bun run start:http`) on the machine where the OpenProject MCP server is hosted.
+- **2. Expose the `/mcp` endpoint**: Ensure `http://HOST:PORT/mcp` is reachable from your MCP client (optionally via reverse proxy, VPN, or SSH tunnel).
+- **3. Configure the client for HTTP**:
+  - Point the client to `http://HOST:PORT/mcp` as the MCP endpoint.
+  - Select **HTTP/Streamable HTTP** (or equivalent) as the transport type in your client's configuration.
+  - Keep `OPENPROJECT_URL` and `OPENPROJECT_API_KEY` configured **only on the server side**; the client never needs the OpenProject API key.
+- **4. Verify the connection**:
+  - Use your client's "list tools" or "introspect MCP servers" feature to confirm that the `openproject` tools are visible.
+  - Call a simple tool such as `get_current_user` or `list_projects` to confirm end-to-end HTTP connectivity.
+
+> The exact JSON configuration format (for example, in `claude_desktop_config.json`, `.cursor/mcp.json`, or other clients) depends on the specific MCP client you use. Refer to your client's documentation for the current syntax for registering **HTTP-based** MCP servers, using `http://HOST:PORT/mcp` as the server URL.
+
+#### Example mcpServers Configuration with HTTP Protocol
+
+For clients that support HTTP transport configuration, use the following format:
+
+```json
+{
+  "mcpServers": {
+    "openproject": {
+      "type": "http",
+      "url": "http://localhost:3100/mcp",
+      "env": {
+        "OPENPROJECT_URL": "https://your-instance.openproject.com",
+        "OPENPROJECT_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+**Remote Server Configuration:**
+
+```json
+{
+  "mcpServers": {
+    "openproject": {
+      "type": "http",
+      "url": "https://your-server.example.com/mcp",
+      "env": {
+        "MCP_HTTP_PORT": "3100",
+        "MCP_HTTP_HOST": "0.0.0.0"
+      }
+    }
+  }
+}
+```
+
+**Notes:**
+- The `type` field specifies HTTP transport (may vary by client: `"http"`, `"streamable-http"`, or `"sse"`)
+- Environment variables in `env` are passed to the HTTP server when applicable
+- For remote servers, ensure the endpoint is accessible and properly secured (HTTPS recommended)
+- The OpenProject credentials (`OPENPROJECT_URL` and `OPENPROJECT_API_KEY`) should be configured **on the server side**, not in the client configuration
+
+---
+
 ### Custom MCP Clients
 
 The server supports two transport mechanisms:
