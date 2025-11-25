@@ -826,7 +826,35 @@ server.prompt(
 
 ## Configuration
 
+### Prerequisites
+
+Before configuring the MCP server, ensure you have:
+
+1. **Bun installed** - The server requires Bun runtime
+   ```bash
+   # Install Bun (macOS, Linux, WSL)
+   curl -fsSL https://bun.sh/install | bash
+
+   # Or using npm
+   npm install -g bun
+   ```
+
+2. **OpenProject API Key** - Generate one from your OpenProject instance:
+   - Navigate to your OpenProject instance
+   - Go to "My account" → "Access tokens"
+   - Click "Generate" and copy the API key
+   - Store it securely (you won't be able to see it again)
+
+3. **Clone this repository**:
+   ```bash
+   git clone https://github.com/yourusername/tonle.git
+   cd tonle
+   bun install
+   ```
+
 ### Environment Variables
+
+The server requires these environment variables:
 
 ```bash
 # Required
@@ -834,57 +862,296 @@ OPENPROJECT_URL=https://your-instance.openproject.com
 OPENPROJECT_API_KEY=your-api-key-here
 
 # Optional
-OPENPROJECT_TIMEOUT=30000
-OPENPROJECT_MAX_RETRIES=3
-MCP_SERVER_PORT=3000
-MCP_LOG_LEVEL=info
+OPENPROJECT_TIMEOUT=30000  # Request timeout in milliseconds (default: 30000)
 ```
 
-### Configuration File
+**Note**: The current implementation reads environment variables directly. Advanced configuration features (rate limiting, retries) are planned for future releases.
 
-```json
-{
-  "openproject": {
-    "url": "https://your-instance.openproject.com",
-    "apiKey": "${OPENPROJECT_API_KEY}",
-    "timeout": 30000,
-    "maxRetries": 3,
-    "rateLimit": {
-      "requestsPerMinute": 100
-    }
-  },
-  "server": {
-    "name": "openproject-mcp",
-    "version": "1.0.0",
-    "transport": "stdio",
-    "logLevel": "info"
-  },
-  "features": {
-    "enableResources": true,
-    "enablePrompts": true,
-    "enableTools": true
-  }
-}
-```
+---
 
-### Claude Desktop Integration
+## MCP Client Configuration
 
-Add to `claude_desktop_config.json`:
+### Claude Desktop
+
+Claude Desktop is Anthropic's official desktop application with built-in MCP support.
+
+#### Configuration Location
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+#### Configuration
+
+Edit or create the `claude_desktop_config.json` file:
 
 ```json
 {
   "mcpServers": {
     "openproject": {
       "command": "bun",
-      "args": ["run", "/path/to/openproject-mcp-server/index.ts"],
+      "args": ["run", "/absolute/path/to/tonle/index.ts"],
       "env": {
         "OPENPROJECT_URL": "https://your-instance.openproject.com",
-        "OPENPROJECT_API_KEY": "your-api-key"
+        "OPENPROJECT_API_KEY": "your-api-key-here"
       }
     }
   }
 }
 ```
+
+**Important**:
+- Use the **absolute path** to your `index.ts` file
+- Replace `your-instance.openproject.com` with your actual OpenProject URL
+- Replace `your-api-key-here` with your generated API key
+- Restart Claude Desktop after configuration changes
+
+#### Verification
+
+1. Restart Claude Desktop
+2. Look for the 🔌 icon in the bottom-right corner
+3. Click it to see available MCP servers
+4. You should see "openproject" listed with available tools
+5. Try asking: "List all my OpenProject projects"
+
+---
+
+### Cursor IDE
+
+Cursor is an AI-powered code editor with MCP support.
+
+#### Configuration Location
+
+- **All platforms**: `.cursor/mcp.json` in your project root or home directory
+
+#### Configuration
+
+Create or edit `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "openproject": {
+      "command": "bun",
+      "args": ["run", "/absolute/path/to/tonle/index.ts"],
+      "env": {
+        "OPENPROJECT_URL": "https://your-instance.openproject.com",
+        "OPENPROJECT_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+**Note**: Check Cursor's documentation for the latest MCP configuration format as it may evolve.
+
+---
+
+### Windsurf IDE
+
+Windsurf is an AI-powered development environment with MCP support.
+
+#### Configuration
+
+Windsurf typically uses a similar configuration format. Check the Windsurf documentation for:
+- Configuration file location
+- MCP server registration format
+- Environment variable handling
+
+Expected configuration format:
+
+```json
+{
+  "mcpServers": {
+    "openproject": {
+      "command": "bun",
+      "args": ["run", "/absolute/path/to/tonle/index.ts"],
+      "env": {
+        "OPENPROJECT_URL": "https://your-instance.openproject.com",
+        "OPENPROJECT_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+---
+
+### MCP Inspector (Development & Testing)
+
+The MCP Inspector is a browser-based tool for testing and debugging MCP servers.
+
+#### Installation & Usage
+
+```bash
+# Run the server with Inspector
+bun run inspect
+
+# Or manually
+bunx @modelcontextprotocol/inspector bun run index.ts
+```
+
+#### What You Can Do
+
+- **Test Tools**: Execute any tool with custom parameters
+- **View Responses**: See raw JSON responses from the OpenProject API
+- **Debug Errors**: Inspect error messages and stack traces
+- **Explore Schema**: View input/output schemas for all tools
+
+#### Inspector Workflow
+
+1. Start the Inspector (it will open in your browser)
+2. The server will automatically connect
+3. Browse available tools in the left sidebar
+4. Select a tool to see its parameters
+5. Fill in parameters and click "Execute"
+6. View the response in the output panel
+
+**Pro Tip**: Use the Inspector to test your OpenProject connection before configuring client applications.
+
+---
+
+### Custom MCP Clients
+
+To integrate with any MCP-compatible client:
+
+1. **Protocol**: The server uses stdio transport (standard input/output)
+2. **Command**: `bun run /path/to/tonle/index.ts`
+3. **Environment Variables**: Pass `OPENPROJECT_URL` and `OPENPROJECT_API_KEY`
+4. **Protocol Version**: MCP SDK version 1.22.0
+
+Example programmatic integration:
+
+```typescript
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+const transport = new StdioClientTransport({
+  command: 'bun',
+  args: ['run', '/path/to/tonle/index.ts'],
+  env: {
+    OPENPROJECT_URL: 'https://your-instance.openproject.com',
+    OPENPROJECT_API_KEY: 'your-api-key',
+  },
+});
+
+const client = new Client({
+  name: 'my-mcp-client',
+  version: '1.0.0',
+}, {
+  capabilities: {}
+});
+
+await client.connect(transport);
+const tools = await client.listTools();
+```
+
+---
+
+## Testing Your Configuration
+
+### Quick Connection Test
+
+After configuring your MCP client, test the connection:
+
+1. **List all tools**: Ask your AI assistant to show available OpenProject tools
+2. **Get current user**: Try `get_current_user` tool to verify authentication
+3. **List projects**: Try `list_projects` to confirm API access
+
+### Example Queries
+
+Try these natural language queries:
+
+- "Show me all my OpenProject projects"
+- "List work packages in project X"
+- "Create a new task in project Y with title 'Setup testing environment'"
+- "Who is the current authenticated user?"
+- "Show me all work package types available"
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Server not appearing in client | Check absolute path to `index.ts`, restart client |
+| Authentication errors | Verify API key is correct and has proper permissions |
+| Connection timeout | Check `OPENPROJECT_URL` is accessible and correct |
+| Bun command not found | Ensure Bun is installed and in your PATH |
+| Tools not loading | Check server logs for errors, verify OpenProject instance is running |
+
+### Viewing Server Logs
+
+When running via MCP clients, server logs (from `console.error()`) typically appear in:
+- **Claude Desktop**: View → Developer → Toggle Developer Tools → Console
+- **MCP Inspector**: Visible in the terminal where you ran the inspector
+- **Cursor/Windsurf**: Check the IDE's output/debug panels
+
+---
+
+## Advanced Configuration
+
+### Using Environment Files
+
+For development, create a `.env` file (never commit this):
+
+```bash
+OPENPROJECT_URL=https://your-instance.openproject.com
+OPENPROJECT_API_KEY=your-api-key-here
+OPENPROJECT_TIMEOUT=30000
+```
+
+Load it before running:
+
+```bash
+# Using bun's built-in env support
+bun run index.ts
+
+# Or manually
+export $(cat .env | xargs) && bun run index.ts
+```
+
+### Multiple OpenProject Instances
+
+To connect to multiple OpenProject instances, create separate server entries:
+
+```json
+{
+  "mcpServers": {
+    "openproject-production": {
+      "command": "bun",
+      "args": ["run", "/path/to/tonle/index.ts"],
+      "env": {
+        "OPENPROJECT_URL": "https://prod.openproject.com",
+        "OPENPROJECT_API_KEY": "prod-api-key"
+      }
+    },
+    "openproject-staging": {
+      "command": "bun",
+      "args": ["run", "/path/to/tonle/index.ts"],
+      "env": {
+        "OPENPROJECT_URL": "https://staging.openproject.com",
+        "OPENPROJECT_API_KEY": "staging-api-key"
+      }
+    }
+  }
+}
+```
+
+### Docker Deployment
+
+While the server primarily uses stdio transport (local only), future HTTP transport support will enable Docker deployment:
+
+```dockerfile
+FROM oven/bun:1
+WORKDIR /app
+COPY package.json bun.lockb ./
+RUN bun install --production
+COPY . .
+ENV OPENPROJECT_URL=""
+ENV OPENPROJECT_API_KEY=""
+CMD ["bun", "run", "index.ts"]
+```
+
+**Note**: HTTP transport implementation is planned for future releases.
 
 ---
 
