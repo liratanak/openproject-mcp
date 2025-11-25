@@ -875,8 +875,8 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "openproject": {
-      "command": "node",
-      "args": ["/path/to/openproject-mcp-server/build/index.js"],
+      "command": "bun",
+      "args": ["run", "/path/to/openproject-mcp-server/index.ts"],
       "env": {
         "OPENPROJECT_URL": "https://your-instance.openproject.com",
         "OPENPROJECT_API_KEY": "your-api-key"
@@ -975,28 +975,25 @@ const ERROR_CODES = {
 # Clone and install
 git clone https://github.com/your-org/openproject-mcp-server.git
 cd openproject-mcp-server
-npm install
+bun install
 
-# Build
-npm run build
-
-# Run with stdio transport
-node build/index.js
+# Run with stdio transport (Bun + TypeScript)
+bun run index.ts
 
 # Test with MCP Inspector
-npx @modelcontextprotocol/inspector build/index.js
+bunx @modelcontextprotocol/inspector bun run index.ts
 ```
 
 ### Docker Deployment
 
 ```dockerfile
-FROM node:20-alpine
+FROM oven/bun:1
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY build ./build
+COPY package.json bun.lockb ./
+RUN bun install --production
+COPY . .
 EXPOSE 3000
-CMD ["node", "build/index.js"]
+CMD ["bun", "run", "index.ts"]
 ```
 
 ### Kubernetes Deployment
@@ -1079,16 +1076,16 @@ git clone https://github.com/your-username/openproject-mcp-server.git
 cd openproject-mcp-server
 
 # Install dependencies
-npm install
+bun install
 
 # Run in development mode
-npm run dev
+bun run dev
 
 # Run tests
-npm test
+bun test
 
 # Build for production
-npm run build
+bun run build
 ```
 
 ### Code Style
