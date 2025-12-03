@@ -169,7 +169,7 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 #### `list_users`
 
-**Description:** Lists users with pagination and filtering.
+**Description:** Lists users with pagination and filtering (administrator accounts only).
 
 **Parameters:**
 - `offset` (number, optional) – Page offset.

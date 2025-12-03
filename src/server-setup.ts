@@ -407,7 +407,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'list_users',
-    'List all users',
+    'List all users (administrator only)',
     {
       offset: z.number().optional().describe('Page offset for pagination'),
       pageSize: z.number().optional().describe('Number of items per page'),
@@ -416,6 +416,14 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     },
     async (params) => {
       try {
+        const currentUser = await client.getCurrentUser();
+        if (!currentUser.admin) {
+          return {
+            content: [{ type: 'text', text: 'Error: list_users requires administrator privileges' }],
+            isError: true,
+          };
+        }
+
         const result = await client.listUsers(params);
         return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
