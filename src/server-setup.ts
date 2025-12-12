@@ -7,6 +7,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { createClient, type OpenProjectClient } from './openproject-client.ts';
+import logger from './logger.ts';
 
 export interface ServerConfig {
   name?: string;
@@ -54,6 +55,37 @@ export function extractResourceId(href: string, resource: string): number | null
   return match ? Number(match[1]) : null;
 }
 
+// Helper to wrap tool handlers with logging
+function wrapToolHandler<T extends z.ZodTypeAny>(
+  client: OpenProjectClient,
+  toolName: string,
+  handler: (params: z.infer<T>) => Promise<any>
+): (params: z.infer<T>) => Promise<any> {
+  return async (params: z.infer<T>) => {
+    const caller = `tool:${toolName}`;
+
+    // Log tool invocation
+    logger.logToolInvocation(caller, toolName, params);
+
+    // Set caller in client for API logging
+    client.setCaller(caller);
+
+    try {
+      const result = await handler(params);
+
+      // Log successful tool result
+      logger.logToolResult(caller, toolName, true, result);
+
+      return result;
+    } catch (error) {
+      // Log failed tool result
+      logger.logToolResult(caller, toolName, false, undefined, error as Error);
+
+      throw error;
+    }
+  };
+}
+
 export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; initClient: () => Promise<OpenProjectClient> } {
   const server = new McpServer({
     name: config.name || 'openproject-mcp',
@@ -63,7 +95,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
   let client: OpenProjectClient;
 
   const initClient = async (): Promise<OpenProjectClient> => {
-    client = createClient();
+    client = createClient('system');
     return client;
   };
 
@@ -74,10 +106,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'Get the OpenProject API root information',
     {},
     async () => {
+      const toolName = 'get_api_root';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.getRoot();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -88,10 +128,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'Get the OpenProject instance configuration',
     {},
     async () => {
+      const toolName = 'get_configuration';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.getConfiguration();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -109,10 +157,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
     },
     async (params) => {
+      const toolName = 'list_projects';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listProjects(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -125,10 +181,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
     },
     async ({ id }) => {
+      const toolName = 'get_project';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getProject(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -147,6 +211,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       parentId: z.number().optional().describe('Parent project ID'),
     },
     async ({ name, identifier, description, public: isPublic, status, statusExplanation, parentId }) => {
+      const toolName = 'create_project';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { name, identifier, description, public: isPublic, status, statusExplanation, parentId });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.createProject>[0] = {
           name,
@@ -159,8 +228,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (parentId) data.parent = { href: createLink('projects', parentId) };
         
         const result = await client.createProject(data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -179,6 +251,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       statusExplanation: z.string().optional().describe('Explanation for the project status'),
     },
     async ({ id, name, description, public: isPublic, active, status, statusExplanation }) => {
+      const toolName = 'update_project';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id, name, description, public: isPublic, active, status, statusExplanation });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.updateProject>[1] = {
           name,
@@ -190,8 +267,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (statusExplanation !== undefined) data.statusExplanation = { raw: statusExplanation };
         
         const result = await client.updateProject(id, data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -204,10 +284,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
     },
     async ({ id }) => {
+      const toolName = 'delete_project';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         await client.deleteProject(id);
         return { content: [{ type: 'text', text: `Project ${id} deleted successfully` }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -226,10 +312,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       groupBy: z.string().optional().describe('Group by attribute'),
     },
     async (params) => {
+      const toolName = 'list_work_packages';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listWorkPackages(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -246,10 +340,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
     },
     async ({ projectId, ...params }) => {
+      const toolName = 'list_project_work_packages';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId, ...params });
+      client.setCaller(caller);
+
       try {
         const result = await client.listProjectWorkPackages(projectId, params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -262,10 +364,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Work package ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_work_package';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getWorkPackage(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -292,6 +402,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       notify: z.boolean().optional().describe('Send notifications (default: true)'),
     },
     async ({ projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify }) => {
+      const toolName = 'create_work_package';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify });
+      client.setCaller(caller);
+
       try {
         const _links: NonNullable<Parameters<typeof client.createWorkPackage>[1]['_links']> = {};
         if (typeId) _links.type = { href: createLink('types', typeId) };
@@ -313,8 +428,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (description) data.description = { raw: description };
 
         const result = await client.createWorkPackage(projectId, data, notify);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -342,6 +460,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       notify: z.boolean().optional().describe('Send notifications'),
     },
     async ({ id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify }) => {
+      const toolName = 'update_work_package';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify });
+      client.setCaller(caller);
+
       try {
         const _links: NonNullable<Parameters<typeof client.updateWorkPackage>[1]['_links']> = {};
         if (typeId) _links.type = { href: createLink('types', typeId) };
@@ -364,8 +487,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (description !== undefined) data.description = { raw: description };
 
         const result = await client.updateWorkPackage(id, data, notify);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -378,10 +504,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Work package ID'),
     },
     async ({ id }) => {
+      const toolName = 'delete_work_package';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         await client.deleteWorkPackage(id);
         return { content: [{ type: 'text', text: `Work package ${id} deleted successfully` }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -394,10 +526,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Work package ID'),
     },
     async ({ id }) => {
+      const toolName = 'list_work_package_activities';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.listWorkPackageActivities(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -415,6 +555,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
     },
     async (params) => {
+      const toolName = 'list_users';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const currentUser = await client.getCurrentUser();
         if (!currentUser.admin) {
@@ -425,8 +570,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         }
 
         const result = await client.listUsers(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -439,10 +587,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.union([z.number(), z.string()]).describe('User ID or "me" for current user'),
     },
     async ({ id }) => {
+      const toolName = 'get_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = id === 'me' ? await client.getCurrentUser() : await client.getUser(id);
         return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -453,10 +607,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'Get the currently authenticated user',
     {},
     async () => {
+      const toolName = 'get_current_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.getCurrentUser();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -475,10 +637,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       password: z.string().optional().describe('Initial password'),
     },
     async (params) => {
+      const toolName = 'create_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.createUser(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -497,10 +667,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       language: z.string().optional().describe('Preferred language'),
     },
     async ({ id, ...data }) => {
+      const toolName = 'update_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id, ...data });
+      client.setCaller(caller);
+
       try {
         const result = await client.updateUser(id, data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -513,10 +691,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('User ID'),
     },
     async ({ id }) => {
+      const toolName = 'delete_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         await client.deleteUser(id);
         return { content: [{ type: 'text', text: `User ${id} deleted successfully` }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -529,10 +713,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('User ID'),
     },
     async ({ id }) => {
+      const toolName = 'lock_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.lockUser(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -545,10 +737,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('User ID'),
     },
     async ({ id }) => {
+      const toolName = 'unlock_user';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.unlockUser(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -566,10 +766,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
     },
     async (params) => {
+      const toolName = 'list_memberships';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listMemberships(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -584,12 +792,20 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       pageSize: z.number().optional().describe('Number of items per page'),
     },
     async ({ projectId, offset, pageSize }) => {
+      const toolName = 'list_project_members';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId, offset, pageSize });
+      client.setCaller(caller);
+
       try {
         const resolvedProjectId = await resolveProjectId(client, projectId);
         const filters = buildProjectMembershipFilter(resolvedProjectId);
         const result = await client.listMemberships({ offset, pageSize, filters });
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -604,6 +820,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       pageSize: z.number().optional().describe('Number of items per page'),
     },
     async ({ workPackageId, offset, pageSize }) => {
+      const toolName = 'list_work_package_members';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { workPackageId, offset, pageSize });
+      client.setCaller(caller);
+
       try {
         const workPackage = await client.getWorkPackage(workPackageId);
         const projectHref = workPackage._links?.project?.href;
@@ -626,6 +847,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         };
         return { content: [{ type: 'text', text: formatResponse(response) }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -638,10 +860,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'List all work package types',
     {},
     async () => {
+      const toolName = 'list_types';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.listTypes();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -654,10 +884,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Type ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_type';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getType(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -670,10 +908,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
     },
     async ({ projectId }) => {
+      const toolName = 'list_project_types';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId });
+      client.setCaller(caller);
+
       try {
         const result = await client.listProjectTypes(projectId);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -686,10 +932,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'List all work package statuses',
     {},
     async () => {
+      const toolName = 'list_statuses';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.listStatuses();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -702,10 +956,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Status ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_status';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getStatus(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -718,10 +980,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     'List all priorities',
     {},
     async () => {
+      const toolName = 'list_priorities';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, {});
+      client.setCaller(caller);
+
       try {
         const result = await client.listPriorities();
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -734,10 +1004,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Priority ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_priority';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getPriority(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -755,10 +1033,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
     },
     async (params) => {
+      const toolName = 'list_time_entries';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listTimeEntries(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -771,10 +1057,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Time entry ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_time_entry';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getTimeEntry(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -792,6 +1086,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       comment: z.string().optional().describe('Comment for the time entry'),
     },
     async ({ projectId, workPackageId, activityId, hours, spentOn, comment }) => {
+      const toolName = 'create_time_entry';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId, workPackageId, activityId, hours, spentOn, comment });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.createTimeEntry>[0] = {
           _links: {
@@ -805,8 +1104,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (comment) data.comment = { raw: comment };
 
         const result = await client.createTimeEntry(data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -823,6 +1125,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       comment: z.string().optional().describe('New comment'),
     },
     async ({ id, activityId, hours, spentOn, comment }) => {
+      const toolName = 'update_time_entry';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id, activityId, hours, spentOn, comment });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.updateTimeEntry>[1] = {
           hours,
@@ -832,8 +1139,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (comment !== undefined) data.comment = { raw: comment };
 
         const result = await client.updateTimeEntry(id, data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -846,10 +1156,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Time entry ID'),
     },
     async ({ id }) => {
+      const toolName = 'delete_time_entry';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         await client.deleteTimeEntry(id);
         return { content: [{ type: 'text', text: `Time entry ${id} deleted successfully` }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -866,10 +1182,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       filters: z.string().optional().describe('JSON filter expression'),
     },
     async (params) => {
+      const toolName = 'list_versions';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listVersions(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -882,10 +1206,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Version ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_version';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getVersion(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -898,10 +1230,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
     },
     async ({ projectId }) => {
+      const toolName = 'list_project_versions';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { projectId });
+      client.setCaller(caller);
+
       try {
         const result = await client.listProjectVersions(projectId);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -920,6 +1260,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sharing: z.enum(['none', 'descendants', 'hierarchy', 'tree', 'system']).optional().describe('Sharing scope'),
     },
     async ({ name, projectId, description, startDate, endDate, status, sharing }) => {
+      const toolName = 'create_version';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { name, projectId, description, startDate, endDate, status, sharing });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.createVersion>[0] = {
           name,
@@ -934,8 +1279,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (description) data.description = { raw: description };
 
         const result = await client.createVersion(data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -954,6 +1302,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       sharing: z.enum(['none', 'descendants', 'hierarchy', 'tree', 'system']).optional().describe('New sharing scope'),
     },
     async ({ id, name, description, startDate, endDate, status, sharing }) => {
+      const toolName = 'update_version';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id, name, description, startDate, endDate, status, sharing });
+      client.setCaller(caller);
+
       try {
         const data: Parameters<typeof client.updateVersion>[1] = {
           name,
@@ -965,8 +1318,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         if (description !== undefined) data.description = { raw: description };
 
         const result = await client.updateVersion(id, data);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -979,10 +1335,16 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Version ID'),
     },
     async ({ id }) => {
+      const toolName = 'delete_version';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         await client.deleteVersion(id);
         return { content: [{ type: 'text', text: `Version ${id} deleted successfully` }] };
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -997,10 +1359,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       id: z.number().describe('Activity ID'),
     },
     async ({ id }) => {
+      const toolName = 'get_activity';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
       try {
         const result = await client.getActivity(id);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }
@@ -1017,10 +1387,18 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       filters: z.string().optional().describe('JSON filter expression'),
     },
     async (params) => {
+      const toolName = 'list_principals';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
       try {
         const result = await client.listPrincipals(params);
-        return { content: [{ type: 'text', text: formatResponse(result) }] };
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
       } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     }

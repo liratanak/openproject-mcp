@@ -3,10 +3,13 @@
  * A typed HTTP client for OpenProject API v3
  */
 
+import logger from './logger.ts';
+
 export interface OpenProjectConfig {
   baseUrl: string;
   apiKey: string;
   timeout?: number;
+  caller?: string;
 }
 
 export interface HALResponse<T = unknown> {
@@ -169,6 +172,7 @@ export interface OpenProjectError {
 export class OpenProjectClient {
   private config: OpenProjectConfig;
   private headers: Record<string, string>;
+  private caller: string;
 
   constructor(config: OpenProjectConfig) {
     this.config = {
@@ -176,6 +180,8 @@ export class OpenProjectClient {
       baseUrl: config.baseUrl.replace(/\/$/, ''), // Remove trailing slash
       timeout: config.timeout ?? 30000,
     };
+
+    this.caller = config.caller || 'unknown';
 
     // Basic Auth with API key as username and 'x' as password
     const credentials = Buffer.from(`apikey:${config.apiKey}`).toString('base64');
@@ -186,6 +192,10 @@ export class OpenProjectClient {
     };
   }
 
+  setCaller(caller: string): void {
+    this.caller = caller;
+  }
+
   private async request<T>(
     method: string,
     endpoint: string,
@@ -193,7 +203,7 @@ export class OpenProjectClient {
     params?: Record<string, string | number | boolean | undefined>
   ): Promise<T> {
     const url = new URL(`${this.config.baseUrl}/api/v3${endpoint}`);
-    
+
     if (params) {
       Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined) {
@@ -201,6 +211,9 @@ export class OpenProjectClient {
         }
       });
     }
+
+    // Log the API request
+    logger.logApiRequest(this.caller, method, endpoint, params, body);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
@@ -219,17 +232,31 @@ export class OpenProjectClient {
 
       if (!response.ok) {
         const error = data as OpenProjectError;
-        throw new Error(
-          `OpenProject API Error: ${error.message || response.statusText} (${error.errorIdentifier || response.status})`
-        );
+        const errorMessage = `OpenProject API Error: ${error.message || response.statusText} (${error.errorIdentifier || response.status})`;
+
+        // Log the API error
+        logger.logApiError(this.caller, method, endpoint, new Error(errorMessage));
+
+        throw new Error(errorMessage);
       }
+
+      // Log the successful API response
+      logger.logApiResponse(this.caller, method, endpoint, response.status, data);
 
       return data as T;
     } catch (error) {
       clearTimeout(timeoutId);
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Request timeout after ${this.config.timeout}ms`);
+        const timeoutError = new Error(`Request timeout after ${this.config.timeout}ms`);
+        logger.logApiError(this.caller, method, endpoint, timeoutError);
+        throw timeoutError;
       }
+
+      // Log any other errors
+      if (error instanceof Error) {
+        logger.logApiError(this.caller, method, endpoint, error);
+      }
+
       throw error;
     }
   }
@@ -590,7 +617,7 @@ export class OpenProjectClient {
   }
 }
 
-export function createClient(): OpenProjectClient {
+export function createClient(caller?: string): OpenProjectClient {
   const baseUrl = process.env.OPENPROJECT_URL;
   const apiKey = process.env.OPENPROJECT_API_KEY || process.env.OPENPROJECT_TOKEN;
 
@@ -606,6 +633,7 @@ export function createClient(): OpenProjectClient {
     baseUrl,
     apiKey,
     timeout: process.env.OPENPROJECT_TIMEOUT ? parseInt(process.env.OPENPROJECT_TIMEOUT) : 30000,
+    caller: caller || 'system',
   });
 }
 

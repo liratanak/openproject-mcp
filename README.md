@@ -85,6 +85,7 @@ Once connected, you can ask your AI assistant to:
 
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Technical architecture, implementation details, and API reference
 - **[MCP_SERVERS.md](./MCP_SERVERS.md)** - Client-specific configuration examples (if available)
+- **[LOGGING.md](./LOGGING.md)** - Comprehensive logging system documentation
 
 ## Features
 
@@ -93,6 +94,7 @@ Once connected, you can ask your AI assistant to:
 - ✅ Stdio transport (local clients)
 - ✅ HTTP transport (remote clients)
 - ✅ Type-safe with TypeScript & Zod validation
+- ✅ Comprehensive logging system (daily logs by caller/initiator)
 
 ## Troubleshooting
 

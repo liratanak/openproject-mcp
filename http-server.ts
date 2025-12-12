@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { setupMcpServer } from './src/server-setup.ts';
+import logger from './src/logger.ts';
 
 export interface HttpServerConfig {
   port?: number;
@@ -18,8 +19,16 @@ export interface HttpServerConfig {
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
 export async function startHttpServer(config: HttpServerConfig = {}) {
+  const caller = 'http-server';
   const port = config.port || parseInt(process.env.MCP_HTTP_PORT || '3100');
   const host = config.host || process.env.MCP_HTTP_HOST || '0.0.0.0';
+
+  logger.logServerEvent(caller, 'Server starting', {
+    transport: 'http',
+    version: '1.0.0',
+    host,
+    port,
+  });
 
   // Setup the MCP server
   const { server, initClient } = setupMcpServer({
@@ -29,12 +38,23 @@ export async function startHttpServer(config: HttpServerConfig = {}) {
 
   // Initialize the OpenProject client
   console.error('Initializing OpenProject connection...');
+  logger.logServerEvent(caller, 'Testing OpenProject connection');
+
   try {
     const client = await initClient();
     const user = await client.getCurrentUser();
     console.error(`Connected as: ${user.name} (${user.login})`);
+    logger.logAuth(caller, true, {
+      userId: user.id,
+      userName: user.name,
+      userLogin: user.login,
+      isAdmin: user.admin,
+    });
   } catch (error) {
     console.error('Failed to connect to OpenProject:', error instanceof Error ? error.message : String(error));
+    logger.logServerEvent(caller, 'OpenProject connection failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
     process.exit(1);
   }
 
@@ -60,6 +80,7 @@ export async function startHttpServer(config: HttpServerConfig = {}) {
 
       // Health check endpoint
       if (url.pathname === '/health' && method === 'GET') {
+        logger.debug('http-server', 'HTTP_REQUEST', 'GET /health');
         return new Response(JSON.stringify({ status: 'ok', transport: 'http' }), {
           headers: { 'Content-Type': 'application/json' },
         });
@@ -67,6 +88,9 @@ export async function startHttpServer(config: HttpServerConfig = {}) {
 
       // Modern Streamable HTTP endpoint
       if (url.pathname === '/mcp') {
+        const sessionId = req.headers.get('mcp-session-id') || 'new';
+        logger.debug('http-server', 'HTTP_REQUEST', `${method} /mcp`, { sessionId });
+
         if (method === 'POST') {
           return handleMcpPost(req, server);
         } else if (method === 'GET') {
@@ -87,6 +111,12 @@ export async function startHttpServer(config: HttpServerConfig = {}) {
   console.error(`OpenProject MCP HTTP Server running on http://${host}:${port}`);
   console.error(`  - Streamable HTTP endpoint: POST/GET/DELETE /mcp`);
   console.error(`  - Health check: GET /health`);
+
+  logger.logServerEvent(caller, 'Server running', {
+    transport: 'http',
+    status: 'ready',
+    url: `http://${host}:${port}`,
+  });
 
   return bunServer;
 }
@@ -122,13 +152,16 @@ async function handleMcpPost(req: Request, mcpServer: ReturnType<typeof setupMcp
       onsessioninitialized: (id) => {
         transports[id] = transport;
         console.error('HTTP session initialized:', id);
+        logger.logSessionEvent('http-server', id, 'initialized');
       },
     });
 
     transport.onclose = () => {
       if (transport.sessionId) {
-        delete transports[transport.sessionId];
-        console.error('HTTP session closed:', transport.sessionId);
+        const sessionId = transport.sessionId;
+        delete transports[sessionId];
+        console.error('HTTP session closed:', sessionId);
+        logger.logSessionEvent('http-server', sessionId, 'closed');
       }
     };
 
@@ -297,11 +330,12 @@ async function handleMcpGet(req: Request): Promise<Response> {
 
 async function handleMcpDelete(req: Request): Promise<Response> {
   const sessionId = req.headers.get('mcp-session-id');
-  
+
   if (!sessionId || !transports[sessionId]) {
+    logger.warn('http-server', 'HTTP_REQUEST', 'DELETE /mcp - Invalid or missing session', { sessionId });
     return new Response(JSON.stringify({ error: 'Invalid or missing session' }), {
       status: 400,
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
       },
@@ -312,8 +346,10 @@ async function handleMcpDelete(req: Request): Promise<Response> {
   await transport.close();
   delete transports[sessionId];
 
+  logger.info('http-server', 'HTTP_REQUEST', 'DELETE /mcp - Session deleted', { sessionId });
+
   return new Response(JSON.stringify({ message: 'Session closed' }), {
-    headers: { 
+    headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
     },
