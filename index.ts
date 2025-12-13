@@ -65,29 +65,6 @@ logger.logServerEvent(caller, 'Process starting', {
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { setupMcpServer } from './src/server-setup.ts';
 
-// Monitor stdin state for debugging
-// NOTE: Do NOT set stdin encoding - MCP SDK expects raw Buffer data
-process.stdin.on('close', () => {
-  console.error('[Tonle MCP] stdin closed');
-  logger.logServerEvent(caller, 'stdin closed');
-});
-
-process.stdin.on('end', () => {
-  console.error('[Tonle MCP] stdin ended');
-  logger.logServerEvent(caller, 'stdin ended');
-});
-
-process.stdin.on('error', (err) => {
-  console.error(`[Tonle MCP] stdin error: ${err.message}`);
-  logger.logServerEvent(caller, 'stdin error', { error: err.message });
-});
-
-// Log stdin state
-console.error(`[Tonle MCP] stdin isTTY: ${process.stdin.isTTY}, readable: ${process.stdin.readable}`);
-logger.logServerEvent(caller, 'stdin state', {
-  isTTY: process.stdin.isTTY,
-  readable: process.stdin.readable,
-});
 
 async function main() {
   try {
