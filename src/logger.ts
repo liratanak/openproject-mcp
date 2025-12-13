@@ -1,10 +1,25 @@
 /**
  * Logging utility for OpenProject MCP Server
  * Creates daily log files separated by caller/initiator
+ *
+ * IMPORTANT: Logs are stored in an absolute path:
+ * ~/Tonle/logs/
+ *
+ * This ensures logs are always written to the same location regardless
+ * of the working directory when the MCP server is started.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+// Get the absolute path to the project root (where this file's parent directory is)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+
+// Default logs directory - always use absolute path
+const DEFAULT_LOGS_DIR = path.join(PROJECT_ROOT, 'logs');
 
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG';
 
@@ -21,10 +36,18 @@ export class Logger {
   private logsDir: string;
   private enableConsole: boolean;
 
-  constructor(logsDir: string = 'logs', enableConsole: boolean = false) {
-    this.logsDir = logsDir;
+  constructor(logsDir?: string, enableConsole: boolean = false) {
+    // Use provided path or default to absolute project logs directory
+    this.logsDir = logsDir || DEFAULT_LOGS_DIR;
     this.enableConsole = enableConsole;
     this.ensureLogsDirectory();
+  }
+
+  /**
+   * Get the logs directory path (useful for debugging/documentation)
+   */
+  getLogsDir(): string {
+    return this.logsDir;
   }
 
   private ensureLogsDirectory(): void {
@@ -160,6 +183,16 @@ export class Logger {
 // Create a singleton instance
 // Default to console logging enabled unless explicitly disabled
 const enableConsole = process.env.LOG_TO_CONSOLE !== 'false';
-const logger = new Logger('logs', enableConsole);
+const logger = new Logger(undefined, enableConsole); // undefined uses DEFAULT_LOGS_DIR
+
+// Log where logs are being written (helps with debugging)
+// This runs at module load time
+try {
+  const initMessage = `Logger initialized. Logs directory: ${logger.getLogsDir()}`;
+  console.error(`[Tonle MCP] ${initMessage}`);
+} catch {
+  // Silently ignore if console.error fails
+}
 
 export default logger;
+export { DEFAULT_LOGS_DIR, PROJECT_ROOT };
