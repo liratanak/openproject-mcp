@@ -65,6 +65,30 @@ logger.logServerEvent(caller, 'Process starting', {
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { setupMcpServer } from './src/server-setup.ts';
 
+// Monitor stdin state for debugging
+// NOTE: Do NOT set stdin encoding - MCP SDK expects raw Buffer data
+process.stdin.on('close', () => {
+  console.error('[Tonle MCP] stdin closed');
+  logger.logServerEvent(caller, 'stdin closed');
+});
+
+process.stdin.on('end', () => {
+  console.error('[Tonle MCP] stdin ended');
+  logger.logServerEvent(caller, 'stdin ended');
+});
+
+process.stdin.on('error', (err) => {
+  console.error(`[Tonle MCP] stdin error: ${err.message}`);
+  logger.logServerEvent(caller, 'stdin error', { error: err.message });
+});
+
+// Log stdin state
+console.error(`[Tonle MCP] stdin isTTY: ${process.stdin.isTTY}, readable: ${process.stdin.readable}`);
+logger.logServerEvent(caller, 'stdin state', {
+  isTTY: process.stdin.isTTY,
+  readable: process.stdin.readable,
+});
+
 async function main() {
   try {
     logger.logServerEvent(caller, 'Server starting', {
@@ -90,29 +114,53 @@ async function main() {
       version: '1.0.0',
     });
 
-    // Initialize the OpenProject client
-    console.error('[Tonle MCP] Testing OpenProject connection...');
-    logger.logServerEvent(caller, 'Testing OpenProject connection');
+    // Connect to MCP transport FIRST - this is critical!
+    // Claude's MCP client expects the server to be ready immediately.
+    // If we delay (e.g., by testing OpenProject first), the client may timeout.
+    const transport = new StdioServerTransport();
+    
+    // Create a promise that resolves when the transport closes
+    // IMPORTANT: Set up event handlers BEFORE connecting to avoid race conditions
+    const transportClosed = new Promise<void>((resolve) => {
+      transport.onclose = () => {
+        console.error('[Tonle MCP] Transport closed');
+        logger.logServerEvent(caller, 'Transport closed', {
+          transport: 'stdio',
+        });
+        resolve();
+      };
 
-    const client = await initClient();
-    const user = await client.getCurrentUser();
-
-    console.error(`[Tonle MCP] Connected as: ${user.name} (${user.login})`);
-    logger.logAuth(caller, true, {
-      userId: user.id,
-      userName: user.name,
-      userLogin: user.login,
-      isAdmin: user.admin,
+      transport.onerror = (error) => {
+        console.error(`[Tonle MCP] Transport error: ${error.message}`);
+        logger.logServerEvent(caller, 'Transport error', {
+          error: error.message,
+        });
+      };
     });
 
-    // Connect to MCP transport
-    const transport = new StdioServerTransport();
+    // Connect the server to the transport immediately
     await server.connect(transport);
 
     console.error('[Tonle MCP] OpenProject MCP Server running on stdio');
     logger.logServerEvent(caller, 'Server running', {
       transport: 'stdio',
       status: 'ready',
+    });
+
+    // Initialize the OpenProject client (lazy - will be used by tools)
+    // Don't test connection on startup to avoid interfering with MCP handshake
+    initClient().catch(() => {
+      // Silently ignore - tools will handle connection errors individually
+    });
+
+    // Keep the process alive by waiting for the transport to close
+    // This is critical - without this, the process exits immediately after connect()
+    await transportClosed;
+
+    // Graceful shutdown
+    console.error('[Tonle MCP] Server shutting down');
+    logger.logServerEvent(caller, 'Server shutdown', {
+      transport: 'stdio',
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -124,5 +172,18 @@ async function main() {
     process.exit(1);
   }
 }
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.error('[Tonle MCP] Received SIGINT, shutting down...');
+  logger.logServerEvent(caller, 'Received SIGINT');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.error('[Tonle MCP] Received SIGTERM, shutting down...');
+  logger.logServerEvent(caller, 'Received SIGTERM');
+  process.exit(0);
+});
 
 main();
