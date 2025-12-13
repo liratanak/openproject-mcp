@@ -325,6 +325,7 @@ export class OpenProjectClient {
     sortBy?: string;
     groupBy?: string;
     showSums?: boolean;
+    query_id?: number;
   }): Promise<HALResponse<WorkPackage>> {
     return this.request('GET', '/work_packages', undefined, params);
   }
@@ -336,6 +337,7 @@ export class OpenProjectClient {
       pageSize?: number;
       filters?: string;
       sortBy?: string;
+      query_id?: number;
     }
   ): Promise<HALResponse<WorkPackage>> {
     return this.request('GET', `/projects/${projectId}/work_packages`, undefined, params);

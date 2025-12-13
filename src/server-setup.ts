@@ -310,6 +310,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       filters: z.string().optional().describe('JSON filter expression'),
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
       groupBy: z.string().optional().describe('Group by attribute'),
+      query_id: z.number().optional().describe('Query ID to apply a saved query/filter'),
     },
     async (params) => {
       const toolName = 'list_work_packages';
@@ -338,6 +339,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       pageSize: z.number().optional().describe('Number of items per page'),
       filters: z.string().optional().describe('JSON filter expression'),
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
+      query_id: z.number().optional().describe('Query ID to apply a saved query/filter'),
     },
     async ({ projectId, ...params }) => {
       const toolName = 'list_project_work_packages';
