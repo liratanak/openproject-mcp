@@ -79,6 +79,8 @@ Once connected, you can ask your AI assistant to:
 - "Create a new task in project X titled 'Setup testing environment'"
 - "Show me all work packages assigned to me"
 - "Update work package #123 to status 'In Progress'"
+- "Move #45, #46 and #47 to the next sprint and assign them all to Bob" (bulk update in one call)
+- "How many hours did Vanntha log last month?" (timesheet totals per user, project and day)
 - And much more...
 
 ## Documentation

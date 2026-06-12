@@ -226,12 +226,12 @@ When referencing related resources, use the `_links` structure:
 
 ### Common Endpoints Currently Implemented
 - **Projects**: CRUD operations, listing with filters
-- **Work Packages**: CRUD, activities, project-scoped listing
+- **Work Packages**: CRUD, activities, project-scoped listing; `bulk_update_work_packages` updates many at once (shared `defaults` plus per-item overrides, auto-fetched lockVersions, per-item success/failure results; helpers in `src/bulk-update.ts`)
 - **Users**: CRUD, lock/unlock, current user
 - **Types**: List available work package types
 - **Statuses**: List available statuses
 - **Priorities**: List available priorities
-- **Time Entries**: CRUD operations
+- **Time Entries**: CRUD operations; `get_timesheet_total` aggregates logged hours for a user or the whole team over named periods (today/yesterday/this_week/last_week/this_month/last_month) or an explicit date range, with per-user/per-project/per-date breakdowns (helpers in `src/timesheet.ts`)
 - **Versions**: CRUD operations (milestones/releases)
 - **Activities**: View journal entries
 - **Principals**: List users, groups, and placeholder users

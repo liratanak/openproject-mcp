@@ -7,6 +7,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { createClient, type OpenProjectClient } from './openproject-client.ts';
+import {
+  TIMESHEET_PERIOD_PRESETS,
+  aggregateTimeEntries,
+  buildTimeEntryFilters,
+  resolvePeriod,
+} from './timesheet.ts';
+import { executeBulkWorkPackageUpdate } from './bulk-update.ts';
 import logger from './logger.ts';
 
 export interface ServerConfig {
@@ -53,6 +60,57 @@ export function extractResourceId(href: string, resource: string): number | null
   const regex = new RegExp(`/${resource}/(\\d+)(?:/|$)`);
   const match = href.match(regex);
   return match ? Number(match[1]) : null;
+}
+
+/**
+ * Resolve a user reference into a user ID. Accepts a numeric ID, "me" for the
+ * authenticated user, or a (partial) name which is looked up via the
+ * principals endpoint (works without admin rights, unlike /users).
+ */
+export async function resolveTimesheetUser(
+  client: OpenProjectClient,
+  userRef: number | string
+): Promise<{ id: number; name?: string }> {
+  if (typeof userRef === 'number') {
+    return { id: userRef };
+  }
+
+  const trimmed = userRef.trim();
+  if (trimmed === '') {
+    throw new Error('User must not be empty; pass a user ID, "me", or a name to search for');
+  }
+
+  if (trimmed.toLowerCase() === 'me') {
+    const me = await client.getCurrentUser();
+    return { id: me.id, name: me.name };
+  }
+
+  const numericId = Number(trimmed);
+  if (Number.isInteger(numericId) && numericId > 0) {
+    return { id: numericId };
+  }
+
+  const filters = JSON.stringify([
+    { type: { operator: '=', values: ['User'] } },
+    { any_name_attribute: { operator: '~', values: [trimmed] } },
+  ]);
+  const result = await client.listPrincipals({ filters, pageSize: 25 });
+  const principals = ((result._embedded?.elements ?? result.elements ?? []) as Array<{ id?: number; name?: string }>)
+    .filter((principal): principal is { id: number; name?: string } => typeof principal?.id === 'number');
+
+  const exactMatches = principals.filter((principal) => principal.name?.toLowerCase() === trimmed.toLowerCase());
+  const matches = exactMatches.length > 0 ? exactMatches : principals;
+
+  if (matches.length === 0) {
+    throw new Error(`No user found matching "${trimmed}"`);
+  }
+  if (matches.length > 1) {
+    const candidates = matches.map((principal) => `${principal.name ?? 'Unnamed'} (ID ${principal.id})`).join(', ');
+    throw new Error(`Multiple users match "${trimmed}": ${candidates}. Use the user ID instead`);
+  }
+
+  const match = matches[0]!;
+  return { id: match.id, name: match.name };
 }
 
 // Helper to wrap tool handlers with logging
@@ -492,6 +550,62 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  const bulkChangeShape = {
+    subject: z.string().optional().describe('New subject/title'),
+    description: z.string().optional().describe('New description (supports markdown)'),
+    typeId: z.number().optional().describe('New type ID'),
+    statusId: z.number().optional().describe('New status ID'),
+    priorityId: z.number().optional().describe('New priority ID'),
+    assigneeId: z.number().optional().describe('New assignee user ID'),
+    responsibleId: z.number().optional().describe('New responsible user ID'),
+    versionId: z.number().optional().describe('New version/milestone ID'),
+    parentId: z.number().optional().describe('New parent work package ID'),
+    startDate: z.string().optional().describe('New start date (YYYY-MM-DD)'),
+    dueDate: z.string().optional().describe('New due date (YYYY-MM-DD)'),
+    estimatedTime: z.string().optional().describe('New estimated time (ISO 8601 duration, e.g., PT8H)'),
+    percentageDone: z.number().min(0).max(100).optional().describe('New completion percentage (0-100)'),
+  };
+
+  server.tool(
+    'bulk_update_work_packages',
+    'Update multiple work packages in one call. Put shared changes in "defaults" (applied to every work package) and/or set fields per item in "updates" (per-item values override defaults). Each work package\'s current lockVersion is fetched automatically when not provided. Updates run sequentially and the response reports the outcome of every item (updated/failed/skipped), so partial success is visible',
+    {
+      updates: z
+        .array(
+          z.object({
+            id: z.number().describe('Work package ID'),
+            lockVersion: z.number().optional().describe('Known lock version (fetched automatically when omitted)'),
+            ...bulkChangeShape,
+          })
+        )
+        .min(1)
+        .max(100)
+        .describe('Work packages to update (1-100). Items only need "id" when "defaults" carries the changes'),
+      defaults: z.object(bulkChangeShape).optional().describe('Shared changes applied to every work package unless overridden per item'),
+      notify: z.boolean().optional().describe('Send notifications for each update (default: true)'),
+      stopOnError: z.boolean().optional().describe('Stop at the first failure and skip the remaining work packages (default: false — continue and report per-item results)'),
+    },
+    async ({ updates, defaults, notify, stopOnError }) => {
+      const toolName = 'bulk_update_work_packages';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { updates, defaults, notify, stopOnError });
+      client.setCaller(caller);
+
+      try {
+        const result = await executeBulkWorkPackageUpdate(client, { updates, defaults, notify, stopOnError });
+        const allFailed = result.summary.updated === 0 && result.summary.failed > 0;
+        logger.logToolResult(caller, toolName, !allFailed, result);
+        if (allFailed) {
+          return { content: [{ type: 'text', text: formatResponse(result) }], isError: true };
+        }
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
@@ -1166,6 +1280,64 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       try {
         await client.deleteTimeEntry(id);
         return { content: [{ type: 'text', text: `Time entry ${id} deleted successfully` }] };
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'get_timesheet_total',
+    'Get timesheet totals (logged hours) for a specific user or the whole team over a time range. Accepts a named period (today, yesterday, this_week, last_week, this_month, last_month; weeks start on Monday, local timezone) or an exact startDate/endDate range. Fetches all matching time entries across pages and returns total entries/hours plus per-user, per-project and per-date breakdowns with hours as decimal numbers (e.g. PT7H30M = 7.5)',
+    {
+      user: z.union([z.number(), z.string()]).optional().describe('User ID, "me" for the authenticated user, or a (partial) user name to look up. Omit to include all users (team totals)'),
+      period: z.enum(TIMESHEET_PERIOD_PRESETS).optional().describe('Named time range relative to today. Use either this or startDate+endDate'),
+      startDate: z.string().optional().describe('Range start date (YYYY-MM-DD, inclusive); required together with endDate when period is not set'),
+      endDate: z.string().optional().describe('Range end date (YYYY-MM-DD, inclusive); required together with startDate when period is not set'),
+      projectId: z.union([z.number(), z.string()]).optional().describe('Optional project ID or identifier to limit the timesheet to one project'),
+      includeEntries: z.boolean().optional().describe('Include the normalized raw time entries in the response (default: false)'),
+    },
+    async ({ user, period, startDate, endDate, projectId, includeEntries }) => {
+      const toolName = 'get_timesheet_total';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { user, period, startDate, endDate, projectId, includeEntries });
+      client.setCaller(caller);
+
+      try {
+        const resolvedPeriod = resolvePeriod({ period, startDate, endDate });
+        const resolvedUser = user === undefined ? undefined : await resolveTimesheetUser(client, user);
+        const resolvedProjectId = projectId === undefined ? undefined : await resolveProjectId(client, projectId);
+
+        const filters = buildTimeEntryFilters({
+          startDate: resolvedPeriod.startDate,
+          endDate: resolvedPeriod.endDate,
+          userId: resolvedUser?.id,
+          projectId: resolvedProjectId,
+        });
+
+        const { entries, total } = await client.listAllTimeEntries({ filters });
+        const aggregation = aggregateTimeEntries(entries);
+
+        const result = {
+          period: resolvedPeriod,
+          user: resolvedUser ?? 'all',
+          projectId: resolvedProjectId,
+          totals: aggregation.totals,
+          byUser: aggregation.byUser,
+          byProject: aggregation.byProject,
+          byDate: aggregation.byDate,
+          validation: {
+            apiReportedTotal: total,
+            entriesFetched: entries.length,
+            complete: entries.length >= total,
+          },
+          warnings: aggregation.warnings.length > 0 ? aggregation.warnings : undefined,
+          entries: includeEntries ? aggregation.entries : undefined,
+        };
+
+        logger.logToolResult(caller, toolName, true, result);
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };

@@ -38,6 +38,7 @@ export interface Project {
 
 export interface WorkPackage {
   id: number;
+  lockVersion: number;
   subject: string;
   description?: { format: string; raw: string; html: string };
   scheduleManually: boolean;
@@ -504,6 +505,32 @@ export class OpenProjectClient {
     sortBy?: string;
   }): Promise<HALResponse<TimeEntry>> {
     return this.request('GET', '/time_entries', undefined, params);
+  }
+
+  /**
+   * Fetch every time entry matching the given filters, following pagination
+   * until the collection is exhausted. OpenProject's `offset` is a 1-based
+   * page number, so pages are requested as offset 1, 2, 3, ...
+   */
+  async listAllTimeEntries(params?: {
+    filters?: string;
+    pageSize?: number;
+    maxPages?: number;
+  }): Promise<{ entries: TimeEntry[]; total: number }> {
+    const pageSize = Math.min(Math.max(params?.pageSize ?? 1000, 1), 1000);
+    const maxPages = params?.maxPages ?? 100;
+    const entries: TimeEntry[] = [];
+    let total = 0;
+
+    for (let offset = 1; offset <= maxPages; offset++) {
+      const page = await this.listTimeEntries({ offset, pageSize, filters: params?.filters });
+      const elements = (page._embedded?.elements as TimeEntry[] | undefined) ?? page.elements ?? [];
+      total = page.total ?? entries.length + elements.length;
+      entries.push(...elements);
+      if (elements.length === 0 || entries.length >= total) break;
+    }
+
+    return { entries, total };
   }
 
   async getTimeEntry(id: number): Promise<TimeEntry> {
