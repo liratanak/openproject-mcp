@@ -81,7 +81,7 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 #### `list_work_packages`
 
-**Description:** Returns work packages with optional filtering, grouping, and pagination.
+**Description:** Returns open work packages by default, with optional filtering, grouping, and pagination. Pass an explicit `filters` value if you need closed tasks.
 
 **Parameters:**
 - `offset` (number, optional) – Page offset.
@@ -90,9 +90,21 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - `sortBy` (string, optional) – JSON sort definition.
 - `groupBy` (string, optional) – Attribute to group by.
 
+#### `list_work_packages_by_status`
+
+**Description:** Lists work packages that have a specific status, or — when `statusId` is omitted — open work packages grouped by status name. The status filter is built for you, so you do not need to hand-write the `filters` JSON. Optionally scope to a project and/or assignee. The response includes `summary` counts, `pagination`, a paged `tasks` list, and `groupedByStatus` for the returned page.
+
+**Parameters:**
+- `statusId` (number | string, optional) – Status ID or status NAME (e.g. `7` or `"In Progress"`, `"New"`, `"Closed"`). Names are resolved to IDs automatically via `list_statuses`; you do not need a separate lookup. Omit to list open work packages grouped by status.
+- `projectId` (number | string, optional) – Project ID or identifier to scope the listing to one project.
+- `assigneeId` (number, optional) – Assignee user ID to return only that member's work packages.
+- `offset` (number, optional) – Page offset (default `1`).
+- `pageSize` (number, optional) – Tasks to list per page (default `100`).
+- `sortBy` (string, optional) – JSON sort definition.
+
 #### `list_project_work_packages`
 
-**Description:** Lists work packages scoped to a specific project.
+**Description:** Lists open work packages scoped to a specific project by default. Pass an explicit `filters` value if you need closed tasks.
 
 **Parameters:**
 - `projectId` (number|string) – Project identifier.
@@ -131,13 +143,13 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 #### `update_work_package`
 
-**Description:** Updates a work package using optimistic locking.
+**Description:** Updates a work package using optimistic locking. The current `lockVersion` is fetched automatically when omitted (preferred for LLM/external callers that do not already know it); a stale `lockVersion` (`UpdateConflict`) is automatically refetched and the update retried once. Only pass the fields you want to change.
 
 **Parameters:**
 - `id` (number) – Work package ID.
-- `lockVersion` (number) – Current lock version.
+- `lockVersion` (number, optional) – Current lock version. Fetched automatically when omitted; a stale version is refetched and the update retried once. Supply it only when you already have a fresh value to skip the extra read.
 - `subject` (string, optional) – Updated subject.
-- `description` (string, optional) – Updated description.
+- `description` (string, optional) – Updated description. Accepts a plain text/markdown string, or an OpenProject-style rich-text object `{ raw: string }` (extra keys like `format`/`html` are ignored) which is coerced to a string.
 - `typeId` (number, optional) – New type ID.
 - `statusId` (number, optional) – New status ID.
 - `priorityId` (number, optional) – New priority ID.
@@ -415,8 +427,6 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - `offset` (number, optional) – Page offset.
 - `pageSize` (number, optional) – Items per page.
 - `filters` (string, optional) – JSON filter expression.
-
-
 
 
 

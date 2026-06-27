@@ -59,6 +59,8 @@ export interface BulkUpdateItemResult {
   appliedChanges?: ChangeField[];
   subject?: string;
   lockVersion?: number;
+  /** True when the first PATCH hit a lockVersion conflict and a refetch+retry was needed. */
+  retried?: boolean;
   error?: string;
   reason?: string;
 }
@@ -140,10 +142,59 @@ export function buildWorkPackageUpdateBody(lockVersion: number, changes: WorkPac
 }
 
 /**
+ * OpenProject rejects a PATCH whose lockVersion is stale with an
+ * `UpdateConflict` error (HTTP 409). This recognizes that case from the error
+ * message the client surfaces so the update can be retried with a fresh
+ * lockVersion.
+ */
+export function isLockVersionConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /UpdateConflict|\b409\b|lockversion|conflict/i.test(message);
+}
+
+async function fetchLockVersion(client: WorkPackageUpdateClient, id: number): Promise<number> {
+  const lockVersion = (await client.getWorkPackage(id)).lockVersion;
+  if (typeof lockVersion !== 'number') {
+    throw new Error(`Could not determine lockVersion for work package ${id}`);
+  }
+  return lockVersion;
+}
+
+/**
+ * PATCH one work package, recovering from a stale lockVersion. The supplied
+ * lockVersion (or a freshly fetched one) is tried first; on a lockVersion
+ * conflict the current version is refetched and the PATCH is retried once.
+ *
+ * Exported so the single-item `update_work_package` MCP tool can share the
+ * same optimistic-locking behavior as `bulk_update_work_packages`: omit
+ * `lockVersion` to auto-fetch the freshest value, or supply a known one to
+ * skip the extra read.
+ */
+export async function updateWithLockRetry(
+  client: WorkPackageUpdateClient,
+  item: BulkUpdateItem,
+  changes: WorkPackageChanges,
+  notify?: boolean
+): Promise<{ workPackage: WorkPackage; retried: boolean }> {
+  const lockVersion = item.lockVersion ?? (await fetchLockVersion(client, item.id));
+  try {
+    const workPackage = await client.updateWorkPackage(item.id, buildWorkPackageUpdateBody(lockVersion, changes), notify);
+    return { workPackage, retried: false };
+  } catch (error) {
+    if (!isLockVersionConflict(error)) throw error;
+    // Stale lockVersion: refetch the current one and retry the PATCH once.
+    const freshLockVersion = await fetchLockVersion(client, item.id);
+    const workPackage = await client.updateWorkPackage(item.id, buildWorkPackageUpdateBody(freshLockVersion, changes), notify);
+    return { workPackage, retried: true };
+  }
+}
+
+/**
  * Update every listed work package sequentially. The whole request is
  * validated up front (duplicates, items without changes) before anything is
  * written. Each item's current lockVersion is fetched right before its PATCH
- * when not supplied. Failures never abort the run unless stopOnError is set;
+ * when not supplied, and a stale lockVersion is automatically refetched and
+ * retried once. Failures never abort the run unless stopOnError is set;
  * the outcome of every item is reported individually.
  */
 export async function executeBulkWorkPackageUpdate(
@@ -197,17 +248,14 @@ export async function executeBulkWorkPackageUpdate(
     }
 
     try {
-      const lockVersion = item.lockVersion ?? (await client.getWorkPackage(item.id)).lockVersion;
-      if (typeof lockVersion !== 'number') {
-        throw new Error(`Could not determine lockVersion for work package ${item.id}`);
-      }
-      const updated = await client.updateWorkPackage(item.id, buildWorkPackageUpdateBody(lockVersion, changes), notify);
+      const { workPackage: updated, retried } = await updateWithLockRetry(client, item, changes, notify);
       results.push({
         id: item.id,
         status: 'updated',
         appliedChanges: fields,
         subject: updated.subject,
         lockVersion: updated.lockVersion,
+        ...(retried ? { retried: true } : {}),
       });
     } catch (error) {
       failed += 1;

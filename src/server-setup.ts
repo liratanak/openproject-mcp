@@ -6,14 +6,23 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { createClient, type OpenProjectClient } from './openproject-client.ts';
+import { createClient, type OpenProjectClient, type Project, type WorkPackage } from './openproject-client.ts';
 import {
   TIMESHEET_PERIOD_PRESETS,
   aggregateTimeEntries,
   buildTimeEntryFilters,
   resolvePeriod,
 } from './timesheet.ts';
-import { executeBulkWorkPackageUpdate } from './bulk-update.ts';
+import { executeBulkWorkPackageUpdate, updateWithLockRetry, type WorkPackageChanges } from './bulk-update.ts';
+import { buildMemberTaskFilters, groupWorkPackagesByProjectMemberStatus } from './member-tasks.ts';
+import {
+  DEFAULT_STATUS_TASK_PAGE_SIZE,
+  buildStatusWorkPackageFilters,
+  getStatusLabelForSummary,
+  groupStatusTasks,
+  summarizeWorkPackagesByStatus,
+  toStatusTask,
+} from './status-tasks.ts';
 import logger from './logger.ts';
 
 export interface ServerConfig {
@@ -31,6 +40,23 @@ export function createLink(type: string, id: number | string): string {
   return `/api/v3/${type}/${id}`;
 }
 
+/**
+ * Lenient `description` input. The OpenProject API *returns* description as a
+ * rich-text object ({ format, raw, html }), and LLM planners sometimes mirror
+ * that object shape when calling write tools. The MCP tool schemas expect a
+ * plain string, so this preprocessor coerces { raw } (or { format, raw, html })
+ * back to a plain string before `z.string()` validates it. The generated JSON
+ * schema still advertises `type: string`; objects are silently normalized.
+ */
+export const descriptionInput = z.preprocess((val) => {
+  if (val == null) return undefined;
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object' && val !== null && typeof (val as Record<string, unknown>).raw === 'string') {
+    return (val as Record<string, string>).raw;
+  }
+  return val;
+}, z.string().optional());
+
 export async function resolveProjectId(client: OpenProjectClient, projectRef: number | string): Promise<number> {
   if (typeof projectRef === 'number') {
     return projectRef;
@@ -43,6 +69,79 @@ export async function resolveProjectId(client: OpenProjectClient, projectRef: nu
 
   const project = await client.getProject(projectRef);
   return project.id;
+}
+
+/**
+ * Resolve a project reference (numeric ID, numeric string, identifier, or human
+ * project NAME) to a project ID and name. Identifiers/names are matched against
+ * the project list — case-insensitive exact match on name or identifier first,
+ * then a unique partial name match — so callers can pass "Demo Project" or
+ * "demo-project" interchangeably. Throws on no match or an ambiguous name.
+ */
+export async function resolveProjectRef(
+  client: OpenProjectClient,
+  projectRef: number | string
+): Promise<{ id: number; name?: string }> {
+  if (typeof projectRef === 'number') {
+    return { id: projectRef };
+  }
+
+  const trimmed = projectRef.trim();
+  if (trimmed === '') {
+    throw new Error('Project must not be empty; pass a project ID, identifier, or name');
+  }
+
+  const numericId = Number(trimmed);
+  if (Number.isInteger(numericId) && numericId > 0) {
+    return { id: numericId };
+  }
+
+  const result = await client.listProjects({ pageSize: 1000 });
+  const projects = (result._embedded?.elements ?? result.elements ?? []) as Project[];
+  const needle = trimmed.toLowerCase();
+  const exact = projects.filter(
+    (project) => project.name.toLowerCase() === needle || project.identifier?.toLowerCase() === needle
+  );
+  const matches = exact.length > 0 ? exact : projects.filter((project) => project.name.toLowerCase().includes(needle));
+
+  if (matches.length === 0) {
+    throw new Error(`No project found matching "${trimmed}"`);
+  }
+  if (matches.length > 1) {
+    const candidates = matches.map((project) => `${project.name} (ID ${project.id})`).join(', ');
+    throw new Error(`Multiple projects match "${trimmed}": ${candidates}. Use the project ID instead`);
+  }
+
+  const match = matches[0]!;
+  return { id: match.id, name: match.name };
+}
+
+/**
+ * Resolve a status reference (numeric ID, numeric string, or status NAME like
+ * "In Progress") to a numeric status ID. When a name is given, the statuses
+ * are listed and matched case-insensitively so callers do not need a separate
+ * `list_statuses` round-trip. Throws a helpful error listing the known
+ * statuses when no match is found.
+ */
+export async function resolveStatusId(client: OpenProjectClient, statusRef: number | string): Promise<number> {
+  if (typeof statusRef === 'number') {
+    return statusRef;
+  }
+
+  const numericId = Number(statusRef);
+  if (!Number.isNaN(numericId) && statusRef.trim() !== '') {
+    return numericId;
+  }
+
+  const result = await client.listStatuses();
+  const statuses = (result._embedded?.elements ?? result.elements ?? []) as Array<{ id: number; name: string }>;
+  const needle = statusRef.trim().toLowerCase();
+  const match = statuses.find((status) => status.name.toLowerCase() === needle);
+  if (!match) {
+    const known = statuses.map((status) => `${status.name} (id=${status.id})`).join(', ');
+    throw new Error(`Unknown status "${statusRef}". Known statuses: ${known}`);
+  }
+  return match.id;
 }
 
 export function buildProjectMembershipFilter(projectId: number): string {
@@ -262,7 +361,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     {
       name: z.string().describe('Name of the project'),
       identifier: z.string().optional().describe('Unique identifier (auto-generated if not provided)'),
-      description: z.string().optional().describe('Project description'),
+      description: descriptionInput.describe('Project description'),
       public: z.boolean().optional().describe('Whether the project is public (default: false)'),
       status: z.enum(['on_track', 'at_risk', 'off_track', 'not_set']).optional().describe('Project status'),
       statusExplanation: z.string().optional().describe('Explanation for the project status'),
@@ -302,7 +401,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     {
       id: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
       name: z.string().optional().describe('New name for the project'),
-      description: z.string().optional().describe('New project description'),
+      description: descriptionInput.describe('New project description'),
       public: z.boolean().optional().describe('Whether the project is public'),
       active: z.boolean().optional().describe('Whether the project is active'),
       status: z.enum(['on_track', 'at_risk', 'off_track', 'not_set']).optional().describe('Project status'),
@@ -361,13 +460,22 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'list_work_packages',
-    'List all work packages with optional filtering',
+    'List all work packages (tasks) with optional filtering. ' +
+      'By default, this returns OPEN work packages only; pass an explicit `filters` value if you need closed tasks. ' +
+      'IMPORTANT — filtering by status (e.g. "In Progress"): statuses are referenced by numeric ID, not name. ' +
+      'Do NOT guess the ID. First call `list_statuses` to resolve the status name to its ID (e.g. "In Progress" -> 7), then pass it in `filters`. ' +
+      'For "In Progress tasks per member", resolve the status ID once with `list_statuses`, then filter by status and assignee. ' +
+      'Filter examples (the `filters` param is a JSON-encoded array of conditions): ' +
+      'by status: [{"status":{"operator":"=","values":["7"]}}]; ' +
+      'by status + assignee: [{"status":{"operator":"=","values":["7"]}},{"assignee":{"operator":"=","values":["3"]}}]; ' +
+      'open work packages only: [{"status":{"operator":"o","values":[]}}]. ' +
+      'Tip: prefer the dedicated `list_work_packages_by_status` tool when filtering by a single status.',
     {
       offset: z.number().optional().describe('Page offset for pagination'),
       pageSize: z.number().optional().describe('Number of items per page'),
-      filters: z.string().optional().describe('JSON filter expression'),
+      filters: z.string().optional().describe('JSON filter expression (array of conditions). Status/assignee values are numeric IDs as strings, e.g. [{"status":{"operator":"=","values":["7"]}}]. Resolve status names to IDs via list_statuses first'),
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
-      groupBy: z.string().optional().describe('Group by attribute'),
+      groupBy: z.string().optional().describe('Group by attribute (e.g. "status" or "assignee")'),
       query_id: z.number().optional().describe('Query ID to apply a saved query/filter'),
     },
     async (params) => {
@@ -377,7 +485,10 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listWorkPackages(params);
+        const effectiveParams = params.filters === undefined && params.query_id === undefined
+          ? { ...params, filters: buildStatusWorkPackageFilters({}) }
+          : params;
+        const result = await client.listWorkPackages(effectiveParams);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -390,12 +501,17 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'list_project_work_packages',
-    'List work packages in a specific project',
+    'List work packages (tasks) in a specific project. ' +
+      'By default, this returns OPEN work packages only; pass an explicit `filters` value if you need closed tasks. ' +
+      'IMPORTANT — to filter by status (e.g. "In Progress"), statuses are referenced by numeric ID, not name: ' +
+      'call `list_statuses` first to resolve the name to its ID, then pass it in `filters` ' +
+      '(e.g. [{"status":{"operator":"=","values":["7"]}}]). ' +
+      'For "In Progress tasks per member" within a project, resolve the status ID once, then filter by status (optionally combined with assignee).',
     {
       projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
       offset: z.number().optional().describe('Page offset for pagination'),
       pageSize: z.number().optional().describe('Number of items per page'),
-      filters: z.string().optional().describe('JSON filter expression'),
+      filters: z.string().optional().describe('JSON filter expression (array of conditions). Status/assignee values are numeric IDs as strings, e.g. [{"status":{"operator":"=","values":["7"]}}]. Resolve status names to IDs via list_statuses first'),
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
       query_id: z.number().optional().describe('Query ID to apply a saved query/filter'),
     },
@@ -406,10 +522,169 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listProjectWorkPackages(projectId, params);
+        const effectiveParams = params.filters === undefined && params.query_id === undefined
+          ? { ...params, filters: buildStatusWorkPackageFilters({}) }
+          : params;
+        const result = await client.listProjectWorkPackages(projectId, effectiveParams);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'list_work_packages_by_status',
+    'List work packages (tasks) by status with summary counts and a paged task list. Pass `statusId` as either a numeric ID or a status NAME string (e.g. "In Progress", "New", "Closed") — names are resolved to IDs automatically, so you do NOT need to call list_statuses first. ' +
+      'Optionally scope to a project (`projectId`) and/or an assignee (`assigneeId`). Task listing defaults to page 1 with 100 records per page unless `offset` or `pageSize` is provided. ' +
+      'If `statusId` is omitted, only OPEN work packages are summarized and listed by status name (closed tasks are excluded by default; pass a closed status explicitly when needed). ' +
+      'NOTE: for requests that group/list tasks BY or PER member (e.g. "In Progress tasks grouped by each member", "... by team members"), prefer the `list_member_tasks` tool — it returns a Project -> Member -> Status -> tasks tree and does the per-member grouping for you. ' +
+      'Use this tool for a flat single-status listing, optionally narrowed to one assignee via `assigneeId`.',
+    {
+      statusId: z.union([z.number(), z.string()]).optional().describe('Status ID or status NAME (e.g. "In Progress", "New"). Resolved automatically when a name is given. Omit to list open work packages grouped by status.'),
+      projectId: z.union([z.number(), z.string()]).optional().describe('Optional project ID or identifier to scope the listing to one project'),
+      assigneeId: z.number().optional().describe('Optional assignee user ID to return only that member\'s work packages'),
+      offset: z.number().optional().describe('Page offset for pagination (defaults to 1)'),
+      pageSize: z.number().optional().describe('Number of tasks to list per page (defaults to 100)'),
+      sortBy: z.string().optional().describe('Sort criteria as JSON array'),
+    },
+    async ({ statusId, projectId, assigneeId, offset, pageSize, sortBy }) => {
+      const toolName = 'list_work_packages_by_status';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { statusId, projectId, assigneeId, offset, pageSize, sortBy });
+      client.setCaller(caller);
+
+      try {
+        const resolvedStatusId = statusId === undefined ? undefined : await resolveStatusId(client, statusId);
+        const filters = buildStatusWorkPackageFilters({ statusId: resolvedStatusId, assigneeId });
+        const effectiveOffset = offset ?? 1;
+        const effectivePageSize = pageSize ?? DEFAULT_STATUS_TASK_PAGE_SIZE;
+
+        const page = projectId === undefined
+          ? await client.listWorkPackages({ offset: effectiveOffset, pageSize: effectivePageSize, sortBy, filters })
+          : await client.listProjectWorkPackages(projectId, { offset: effectiveOffset, pageSize: effectivePageSize, sortBy, filters });
+
+        const workPackages = (page._embedded?.elements ?? page.elements ?? []) as Array<WorkPackage>;
+        const tasks = workPackages.map(toStatusTask);
+        const pageTotal = page.total ?? workPackages.length;
+        const responseOffset = page.offset ?? effectiveOffset;
+        const responsePageSize = page.pageSize ?? effectivePageSize;
+        const hasMore = tasks.length > 0 && responseOffset * responsePageSize < pageTotal;
+
+        const allForSummary = resolvedStatusId === undefined
+          ? await client.listAllWorkPackages({ projectId, filters, sortBy, pageSize: 1000 })
+          : undefined;
+        const byStatus = resolvedStatusId === undefined
+          ? summarizeWorkPackagesByStatus(allForSummary?.workPackages ?? [])
+          : [
+              {
+                statusId: resolvedStatusId,
+                status: getStatusLabelForSummary(workPackages, { statusId: resolvedStatusId, statusRef: statusId }),
+                count: pageTotal,
+              },
+            ];
+        const groupedResult = {
+          filters: {
+            statusId: resolvedStatusId ?? null,
+            statusRef: statusId ?? null,
+            openOnly: resolvedStatusId === undefined,
+            projectId: projectId ?? null,
+            assigneeId: assigneeId ?? null,
+          },
+          summary: {
+            total: resolvedStatusId === undefined ? allForSummary?.total ?? 0 : pageTotal,
+            returned: tasks.length,
+            statusCount: byStatus.length,
+            byStatus,
+            complete: resolvedStatusId !== undefined || (allForSummary?.workPackages.length ?? 0) >= (allForSummary?.total ?? 0),
+          },
+          pagination: {
+            offset: responseOffset,
+            pageSize: responsePageSize,
+            count: page.count ?? tasks.length,
+            returned: tasks.length,
+            total: pageTotal,
+            hasMore,
+          },
+          tasks,
+          groupedByStatus: groupStatusTasks(tasks),
+        };
+
+        const response = { content: [{ type: 'text', text: formatResponse(groupedResult) }] };
+        logger.logToolResult(caller, toolName, true, groupedResult);
+        return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'list_member_tasks',
+    'List tasks of each member as a nested hierarchy: Level 1 Project -> Level 2 Member (assignee) -> Level 3 Status -> Level 4 task list. ' +
+      'Every level includes a taskCount, and unassigned tasks are grouped under an "Unassigned" member. ' +
+      'USE THIS TOOL whenever a request asks to list / extract / show / break down / organize tasks BY, PER, or FOR EACH member (also phrased "grouped by each member", "by team members", "for every member", "what each person is working on", "tasks each member has") — it does the per-member grouping for you, so prefer it over list_work_packages_by_status and list_work_packages for these requests. ' +
+      'Pass `statusId` (NAME or ID) to restrict the tree to a single status. Examples mapping requests to calls: ' +
+      '"Extract all tasks currently marked as In Progress group by each member" -> list_member_tasks(statusId="In Progress"); ' +
+      '"an easy-to-read list of all tasks that are currently marked as In Progress by team members" -> list_member_tasks(statusId="In Progress"); ' +
+      '"what is everyone working on" / "tasks per member" -> list_member_tasks(); ' +
+      '"In Progress tasks for Jane in the Demo project" -> list_member_tasks(statusId="In Progress", projectId="Demo Project", userId=<Jane id>). ' +
+      'All filters are OPTIONAL; with no explicit `statusId`, it returns the Project -> Member -> Status -> tasks tree for OPEN work packages only (closed tasks are excluded by default; pass a closed status explicitly when needed). ' +
+      'Optional filters: `userId` (assignee user ID) narrows to one member; `projectId` accepts a project ID, identifier, OR human name (e.g. "Demo Project"); ' +
+      '`statusId` accepts a status ID OR status NAME (e.g. "In Progress") — names are resolved automatically, so you do NOT need to call list_statuses first. ' +
+      'The output keeps the same nested shape no matter which filters are applied.',
+    {
+      userId: z.number().optional().describe('Optional assignee user ID — show only this member\'s tasks'),
+      projectId: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe('Optional project ID, identifier, or NAME (e.g. "Demo Project") to scope to a single project'),
+      statusId: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe('Optional status ID or status NAME (e.g. "In Progress"); a name is resolved to its ID automatically'),
+    },
+    async ({ userId, projectId, statusId }) => {
+      const toolName = 'list_member_tasks';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { userId, projectId, statusId });
+      client.setCaller(caller);
+
+      try {
+        const resolvedProject = projectId === undefined ? undefined : await resolveProjectRef(client, projectId);
+        const resolvedStatusId = statusId === undefined ? undefined : await resolveStatusId(client, statusId);
+
+        const filters = buildMemberTaskFilters({ assigneeId: userId, statusId: resolvedStatusId });
+        const { workPackages, total } = await client.listAllWorkPackages({
+          projectId: resolvedProject?.id,
+          filters,
+        });
+
+        const hierarchy = groupWorkPackagesByProjectMemberStatus(workPackages);
+
+        const result = {
+          filters: {
+            userId: userId ?? null,
+            project: resolvedProject ? { id: resolvedProject.id, name: resolvedProject.name ?? null } : null,
+            status: resolvedStatusId ?? null,
+            openOnly: resolvedStatusId === undefined,
+          },
+          totalTasks: hierarchy.totalTasks,
+          projectCount: hierarchy.projectCount,
+          projects: hierarchy.projects,
+          validation: {
+            apiReportedTotal: total,
+            tasksFetched: workPackages.length,
+            complete: workPackages.length >= total,
+          },
+        };
+
+        logger.logToolResult(caller, toolName, true, result);
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
@@ -447,7 +722,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     {
       projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
       subject: z.string().describe('Subject/title of the work package'),
-      description: z.string().optional().describe('Detailed description (supports markdown)'),
+      description: descriptionInput.describe('Detailed description (supports markdown)'),
       typeId: z.number().optional().describe('Work package type ID'),
       statusId: z.number().optional().describe('Status ID'),
       priorityId: z.number().optional().describe('Priority ID'),
@@ -500,12 +775,12 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'update_work_package',
-    'Update an existing work package',
+    'Update an existing work package. The current lockVersion is fetched automatically when omitted (preferred); a stale lockVersion (UpdateConflict) is automatically refetched and the update retried once. Pass only the fields you want to change.',
     {
       id: z.number().describe('Work package ID'),
-      lockVersion: z.number().describe('Current lock version (for optimistic locking)'),
+      lockVersion: z.number().optional().describe('Current lock version (for optimistic locking). Fetched automatically when omitted; a stale version is refetched and the update retried once.'),
       subject: z.string().optional().describe('New subject/title'),
-      description: z.string().optional().describe('New description'),
+      description: descriptionInput.describe('New description (plain text/markdown string)'),
       typeId: z.number().optional().describe('New type ID'),
       statusId: z.number().optional().describe('New status ID'),
       priorityId: z.number().optional().describe('New priority ID'),
@@ -526,27 +801,23 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const _links: NonNullable<Parameters<typeof client.updateWorkPackage>[1]['_links']> = {};
-        if (typeId) _links.type = { href: createLink('types', typeId) };
-        if (statusId) _links.status = { href: createLink('statuses', statusId) };
-        if (priorityId) _links.priority = { href: createLink('priorities', priorityId) };
-        if (assigneeId) _links.assignee = { href: createLink('users', assigneeId) };
-        if (responsibleId) _links.responsible = { href: createLink('users', responsibleId) };
-        if (versionId) _links.version = { href: createLink('versions', versionId) };
-        if (parentId) _links.parent = { href: createLink('work_packages', parentId) };
-
-        const data: Parameters<typeof client.updateWorkPackage>[1] = {
-          lockVersion,
+        const changes: WorkPackageChanges = {
           subject,
-          _links: Object.keys(_links).length > 0 ? _links : undefined,
+          description,
+          typeId,
+          statusId,
+          priorityId,
+          assigneeId,
+          responsibleId,
+          versionId,
+          parentId,
           startDate,
           dueDate,
           estimatedTime,
           percentageDone,
         };
-        if (description !== undefined) data.description = { raw: description };
 
-        const result = await client.updateWorkPackage(id, data, notify);
+        const { workPackage: result } = await updateWithLockRetry(client, { id, lockVersion }, changes, notify);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -559,7 +830,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   const bulkChangeShape = {
     subject: z.string().optional().describe('New subject/title'),
-    description: z.string().optional().describe('New description (supports markdown)'),
+    description: descriptionInput.describe('New description (supports markdown)'),
     typeId: z.number().optional().describe('New type ID'),
     statusId: z.number().optional().describe('New status ID'),
     priorityId: z.number().optional().describe('New priority ID'),
@@ -575,7 +846,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'bulk_update_work_packages',
-    'Update multiple work packages in one call. Put shared changes in "defaults" (applied to every work package) and/or set fields per item in "updates" (per-item values override defaults). Each work package\'s current lockVersion is fetched automatically when not provided. Updates run sequentially and the response reports the outcome of every item (updated/failed/skipped), so partial success is visible',
+    'Update multiple work packages in one call. Put shared changes in "defaults" (applied to every work package) and/or set fields per item in "updates" (per-item values override defaults). Each work package\'s current lockVersion is fetched automatically when not provided; prefer omitting lockVersion so the freshest value is used. A stale lockVersion (UpdateConflict) is automatically refetched and the update retried once. Updates run sequentially and the response reports the outcome of every item (updated/failed/skipped, with "retried" flagged when a conflict was recovered); the call is marked as an error if ANY item fails, so partial failures are never mistaken for full success',
     {
       updates: z
         .array(
@@ -600,9 +871,12 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
       try {
         const result = await executeBulkWorkPackageUpdate(client, { updates, defaults, notify, stopOnError });
-        const allFailed = result.summary.updated === 0 && result.summary.failed > 0;
-        logger.logToolResult(caller, toolName, !allFailed, result);
-        if (allFailed) {
+        // Surface ANY per-item failure (not only an all-failed batch) so partial
+        // failures — e.g. a work package left unchanged by a lock conflict — are
+        // not mistaken for full success.
+        const hasFailures = result.summary.failed > 0;
+        logger.logToolResult(caller, toolName, !hasFailures, result);
+        if (hasFailures) {
           return { content: [{ type: 'text', text: formatResponse(result) }], isError: true };
         }
         return { content: [{ type: 'text', text: formatResponse(result) }] };
@@ -1045,7 +1319,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'list_statuses',
-    'List all work package statuses',
+    'List all work package statuses with their IDs and names (e.g. "New", "In Progress", "Closed"). ' +
+      'Call this FIRST only when you must pass a numeric status ID to a tool that does NOT resolve names — i.e. a raw `status` filter on list_work_packages / list_project_work_packages: ' +
+      '(1) call list_statuses to find the ID of "In Progress", (2) pass that ID in the status filter. ' +
+      'You do NOT need this for list_member_tasks or list_work_packages_by_status — both accept a status NAME directly and resolve it for you. ' +
+      'For "In Progress tasks grouped/listed per member (or by team members)", skip this and call list_member_tasks(statusId="In Progress").',
     {},
     async () => {
       const toolName = 'list_statuses';
@@ -1427,7 +1705,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     {
       name: z.string().describe('Version name'),
       projectId: z.number().describe('Defining project ID'),
-      description: z.string().optional().describe('Version description'),
+      description: descriptionInput.describe('Version description'),
       startDate: z.string().optional().describe('Start date (YYYY-MM-DD)'),
       endDate: z.string().optional().describe('End date (YYYY-MM-DD)'),
       status: z.enum(['open', 'locked', 'closed']).optional().describe('Version status'),
@@ -1469,7 +1747,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     {
       id: z.number().describe('Version ID'),
       name: z.string().optional().describe('New version name'),
-      description: z.string().optional().describe('New description'),
+      description: descriptionInput.describe('New description'),
       startDate: z.string().optional().describe('New start date'),
       endDate: z.string().optional().describe('New end date'),
       status: z.enum(['open', 'locked', 'closed']).optional().describe('New status'),
@@ -1580,4 +1858,3 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   return { server, initClient };
 }
-

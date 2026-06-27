@@ -344,6 +344,38 @@ export class OpenProjectClient {
     return this.request('GET', `/projects/${projectId}/work_packages`, undefined, params);
   }
 
+  /**
+   * Fetch every work package matching the given filters, following pagination
+   * until the collection is exhausted. Mirrors listAllTimeEntries: OpenProject's
+   * `offset` is a 1-based page number, so pages are requested as 1, 2, 3, ...
+   * When `projectId` is given the project-scoped endpoint is used instead of
+   * the global one.
+   */
+  async listAllWorkPackages(params?: {
+    projectId?: number | string;
+    filters?: string;
+    sortBy?: string;
+    pageSize?: number;
+    maxPages?: number;
+  }): Promise<{ workPackages: WorkPackage[]; total: number }> {
+    const pageSize = Math.min(Math.max(params?.pageSize ?? 200, 1), 1000);
+    const maxPages = params?.maxPages ?? 100;
+    const workPackages: WorkPackage[] = [];
+    let total = 0;
+
+    for (let offset = 1; offset <= maxPages; offset++) {
+      const page = params?.projectId === undefined
+        ? await this.listWorkPackages({ offset, pageSize, filters: params?.filters, sortBy: params?.sortBy })
+        : await this.listProjectWorkPackages(params.projectId, { offset, pageSize, filters: params?.filters, sortBy: params?.sortBy });
+      const elements = (page._embedded?.elements as WorkPackage[] | undefined) ?? page.elements ?? [];
+      total = page.total ?? workPackages.length + elements.length;
+      workPackages.push(...elements);
+      if (elements.length === 0 || workPackages.length >= total) break;
+    }
+
+    return { workPackages, total };
+  }
+
   async getWorkPackage(id: number): Promise<WorkPackage> {
     return this.request('GET', `/work_packages/${id}`);
   }
