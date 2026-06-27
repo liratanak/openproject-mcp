@@ -9,18 +9,32 @@ import type { WorkPackage } from '../src/openproject-client.ts';
 import {
   buildWorkPackageUpdateBody,
   executeBulkWorkPackageUpdate,
+  isLockVersionConflict,
   listChangedFields,
   mergeWorkPackageChanges,
   type WorkPackageUpdateBody,
   type WorkPackageUpdateClient,
 } from '../src/bulk-update.ts';
 
+const LOCK_CONFLICT_ERROR =
+  'OpenProject API Error: Information has been updated by at least one other user in the meantime (urn:openproject-org:api:v3:errors:UpdateConflict)';
+
 function makeFakeClient(
   workPackages: Record<number, { lockVersion: number; subject: string }>,
-  options?: { failUpdateIds?: number[]; failGetIds?: number[] }
+  options?: {
+    failUpdateIds?: number[];
+    failGetIds?: number[];
+    /** Throw a lockVersion conflict for the first N PATCH attempts, then succeed. */
+    conflictOnceIds?: number[];
+    /** Always throw a lockVersion conflict for these IDs. */
+    conflictPersistIds?: number[];
+  }
 ) {
   const getCalls: number[] = [];
   const updateCalls: Array<{ id: number; data: WorkPackageUpdateBody; notify?: boolean }> = [];
+  const conflictsRemaining = new Map<number, number>();
+  for (const id of options?.conflictOnceIds ?? []) conflictsRemaining.set(id, 1);
+  for (const id of options?.conflictPersistIds ?? []) conflictsRemaining.set(id, Number.POSITIVE_INFINITY);
 
   const client: WorkPackageUpdateClient = {
     async getWorkPackage(id) {
@@ -33,8 +47,14 @@ function makeFakeClient(
     },
     async updateWorkPackage(id, data, notify) {
       updateCalls.push({ id, data, notify });
+      const remainingConflicts = conflictsRemaining.get(id) ?? 0;
+      if (remainingConflicts > 0) {
+        conflictsRemaining.set(id, remainingConflicts - 1);
+        throw new Error(LOCK_CONFLICT_ERROR);
+      }
       if (options?.failUpdateIds?.includes(id)) {
-        throw new Error('OpenProject API Error: Update conflict (UpdateConflict)');
+        // A non-conflict, non-retryable validation error.
+        throw new Error("OpenProject API Error: Subject can't be blank (PropertyConstraintViolation)");
       }
       const workPackage = workPackages[id];
       return {
@@ -47,6 +67,19 @@ function makeFakeClient(
 
   return { client, getCalls, updateCalls };
 }
+
+describe('isLockVersionConflict', () => {
+  test('recognizes OpenProject lock conflict errors', () => {
+    expect(isLockVersionConflict(new Error(LOCK_CONFLICT_ERROR))).toBe(true);
+    expect(isLockVersionConflict(new Error('OpenProject API Error: stale lockVersion (UpdateConflict)'))).toBe(true);
+    expect(isLockVersionConflict(new Error('Request failed with status 409'))).toBe(true);
+  });
+
+  test('does not treat unrelated errors as conflicts', () => {
+    expect(isLockVersionConflict(new Error("OpenProject API Error: Subject can't be blank (PropertyConstraintViolation)"))).toBe(false);
+    expect(isLockVersionConflict(new Error('OpenProject API Error: Work package 5 not found (NotFound)'))).toBe(false);
+  });
+});
 
 describe('mergeWorkPackageChanges', () => {
   test('item fields override defaults, defaults fill the gaps', () => {
@@ -180,13 +213,67 @@ describe('executeBulkWorkPackageUpdate', () => {
       defaults: { percentageDone: 100 },
     });
 
+    // A non-conflict failure is not retried, so 102 is attempted exactly once.
     expect(updateCalls.map((call) => call.id)).toEqual([101, 102, 103]);
     expect(result.summary).toEqual({ requested: 3, updated: 2, failed: 1, skipped: 0 });
     expect(result.results[1]).toEqual({
       id: 102,
       status: 'failed',
-      error: 'OpenProject API Error: Update conflict (UpdateConflict)',
+      error: "OpenProject API Error: Subject can't be blank (PropertyConstraintViolation)",
     });
+  });
+
+  test('retries with a refetched lockVersion after a stale-lock conflict, then succeeds', async () => {
+    const { client, getCalls, updateCalls } = makeFakeClient(initial, { conflictOnceIds: [102] });
+
+    const result = await executeBulkWorkPackageUpdate(client, {
+      updates: [{ id: 101 }, { id: 102 }, { id: 103 }],
+      defaults: { statusId: 7 },
+    });
+
+    // 102 is fetched again and PATCHed again after the conflict; 101 and 103 once each.
+    expect(getCalls).toEqual([101, 102, 102, 103]);
+    expect(updateCalls.map((call) => call.id)).toEqual([101, 102, 102, 103]);
+    expect(result.summary).toEqual({ requested: 3, updated: 3, failed: 0, skipped: 0 });
+    expect(result.results[1]).toEqual({
+      id: 102,
+      status: 'updated',
+      appliedChanges: ['statusId'],
+      subject: 'Task B',
+      lockVersion: 2,
+      retried: true,
+    });
+  });
+
+  test('retries a stale lockVersion supplied on the item', async () => {
+    const { client, getCalls, updateCalls } = makeFakeClient(initial, { conflictOnceIds: [101] });
+
+    const result = await executeBulkWorkPackageUpdate(client, {
+      // A stale lockVersion the caller remembered from an earlier read.
+      updates: [{ id: 101, lockVersion: 1, statusId: 7 }],
+    });
+
+    // First PATCH uses the supplied (stale) version; after the conflict the
+    // current version is fetched and the retry uses it.
+    expect(getCalls).toEqual([101]);
+    expect(updateCalls.map((call) => call.data.lockVersion)).toEqual([1, 3]);
+    expect(result.summary).toEqual({ requested: 1, updated: 1, failed: 0, skipped: 0 });
+    expect(result.results[0]?.retried).toBe(true);
+  });
+
+  test('reports a failure when the lock conflict persists after the retry', async () => {
+    const { client, getCalls, updateCalls } = makeFakeClient(initial, { conflictPersistIds: [102] });
+
+    const result = await executeBulkWorkPackageUpdate(client, {
+      updates: [{ id: 102, statusId: 7 }],
+    });
+
+    // Initial fetch + PATCH (conflict) + refetch + retry PATCH (conflict) → failed.
+    expect(getCalls).toEqual([102, 102]);
+    expect(updateCalls.length).toBe(2);
+    expect(result.summary).toEqual({ requested: 1, updated: 0, failed: 1, skipped: 0 });
+    expect(result.results[0]?.status).toBe('failed');
+    expect(result.results[0]?.error).toContain('UpdateConflict');
   });
 
   test('stopOnError skips the remaining work packages after a failure', async () => {
