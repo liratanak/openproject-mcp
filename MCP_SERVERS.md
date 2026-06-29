@@ -104,7 +104,7 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 #### `list_project_work_packages`
 
-**Description:** Lists open work packages scoped to a specific project by default. Pass an explicit `filters` value if you need closed tasks.
+**Description:** Lists open work packages scoped to a specific project by default. Pass an explicit `filters` value if you need closed tasks. Do not use this for search/find/look up/locate/related/relevant/keyword requests; use `search_work_packages` instead, or `semantic_search_project_work_packages` for project-scoped related/relevant ticket discovery.
 
 **Parameters:**
 - `projectId` (number|string) – Project identifier.
@@ -112,6 +112,34 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - `pageSize` (number, optional) – Items per page.
 - `filters` (string, optional) – JSON filter expression.
 - `sortBy` (string, optional) – JSON sort definition.
+
+#### `search_work_packages`
+
+**Description:** Smart text search for work packages. Use this whenever the request asks to search, find, look up, locate, or match work packages by title, description, comments, attachments, similar words, or possible typos. If the request is scoped to a project, pass `projectId` here instead of using `list_project_work_packages`.
+
+**Parameters:**
+- `query` (string) – Natural text, keywords, phrase, typo-tolerant text, or a work package ID like `#123`.
+- `projectId` (number|string, optional) – Project ID, identifier, or name to scope the search.
+- `statusId` (number|string, optional) – Status ID or status name. Omit to search open work packages unless `includeClosed` is true.
+- `assigneeId` (number, optional) – Assignee user ID.
+- `includeClosed` (boolean, optional) – Search closed work packages too when `statusId` is omitted.
+- `limit` (number, optional) – Maximum ranked results to return.
+- `candidatePageSize` (number, optional) – Candidate page size for ranking.
+- `maxPages` (number, optional) – Maximum candidate pages to fetch.
+- `sortBy` (string, optional) – OpenProject sort definition for candidate fetching.
+
+#### `semantic_search_project_work_packages`
+
+**Description:** Project-scoped in-memory related/relevant ticket search over the latest updated work packages. Use this for project-specific search/find/look for/related/similar/relevant ticket requests. The tool loads only the latest updated project work packages into RAM, capped at 500, requests only ID, subject, description, and updatedAt, builds a local subject/description TF-IDF vector index, and blends vector, keyword, and fuzzy relevance.
+
+**Parameters:**
+- `projectId` (number|string) – Project ID, identifier, or name to search within.
+- `query` (string) – Natural text, keywords, or phrase to find related/relevant tickets.
+- `statusId` (number|string, optional) – Status ID or status name. Omit to search open work packages unless `includeClosed` is true.
+- `assigneeId` (number, optional) – Assignee user ID.
+- `includeClosed` (boolean, optional) – Include closed work packages when `statusId` is omitted.
+- `limit` (number, optional) – Maximum ranked results to return.
+- `candidateLimit` (number, optional) – How many latest-updated project work packages to load into RAM, max 500.
 
 #### `get_work_package`
 
@@ -427,7 +455,6 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - `offset` (number, optional) – Page offset.
 - `pageSize` (number, optional) – Items per page.
 - `filters` (string, optional) – JSON filter expression.
-
 
 
 

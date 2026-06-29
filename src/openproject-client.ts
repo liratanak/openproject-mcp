@@ -469,6 +469,7 @@ export class OpenProjectClient {
     groupBy?: string;
     showSums?: boolean;
     query_id?: number;
+    select?: string;
   }): Promise<HALResponse<WorkPackage>> {
     return this.request('GET', '/work_packages', undefined, params);
   }
@@ -481,6 +482,7 @@ export class OpenProjectClient {
       filters?: string;
       sortBy?: string;
       query_id?: number;
+      select?: string;
     }
   ): Promise<HALResponse<WorkPackage>> {
     return this.request('GET', `/projects/${projectId}/work_packages`, undefined, params);
@@ -499,6 +501,7 @@ export class OpenProjectClient {
     sortBy?: string;
     pageSize?: number;
     maxPages?: number;
+    select?: string;
   }): Promise<{ workPackages: WorkPackage[]; total: number }> {
     const pageSize = Math.min(Math.max(params?.pageSize ?? 200, 1), 1000);
     const maxPages = params?.maxPages ?? 100;
@@ -507,8 +510,8 @@ export class OpenProjectClient {
 
     for (let offset = 1; offset <= maxPages; offset++) {
       const page = params?.projectId === undefined
-        ? await this.listWorkPackages({ offset, pageSize, filters: params?.filters, sortBy: params?.sortBy })
-        : await this.listProjectWorkPackages(params.projectId, { offset, pageSize, filters: params?.filters, sortBy: params?.sortBy });
+        ? await this.listWorkPackages({ offset, pageSize, filters: params?.filters, sortBy: params?.sortBy, select: params?.select })
+        : await this.listProjectWorkPackages(params.projectId, { offset, pageSize, filters: params?.filters, sortBy: params?.sortBy, select: params?.select });
       const elements = (page._embedded?.elements as WorkPackage[] | undefined) ?? page.elements ?? [];
       total = page.total ?? workPackages.length + elements.length;
       workPackages.push(...elements);

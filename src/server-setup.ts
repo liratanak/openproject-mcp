@@ -30,6 +30,23 @@ import {
   summarizeWorkPackagesByStatus,
   toStatusTask,
 } from './status-tasks.ts';
+import {
+  MAX_WORK_PACKAGE_SEARCH_LIMIT,
+  MAX_WORK_PACKAGE_SEARCH_MAX_PAGES,
+  MAX_WORK_PACKAGE_SEARCH_PAGE_SIZE,
+  MAX_PROJECT_MEMORY_CANDIDATE_LIMIT,
+  PROJECT_MEMORY_SEARCH_SELECT,
+  PROJECT_MEMORY_SEARCH_SORT_BY,
+  buildWorkPackageSearchFilters,
+  clampProjectMemoryCandidateLimit,
+  clampSearchLimit,
+  clampSearchMaxPages,
+  clampSearchPageSize,
+  mergeWorkPackages,
+  parseWorkPackageIdQuery,
+  rankProjectMemorySearchResults,
+  rankWorkPackageSearchResults,
+} from './work-package-search.ts';
 import logger from './logger.ts';
 
 export interface ServerConfig {
@@ -552,6 +569,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
   server.tool(
     'list_project_work_packages',
     'List work packages (tasks) in a specific project. ' +
+      'Do NOT use this for search/find/look up/locate/related/relevant/keyword requests; use `search_work_packages` instead, or `semantic_search_project_work_packages` when the user wants project-scoped related/relevant tickets. ' +
       'By default, this returns OPEN work packages only; pass an explicit `filters` value if you need closed tasks. ' +
       'IMPORTANT — to filter by status (e.g. "In Progress"), statuses are referenced by numeric ID, not name: ' +
       'call `list_statuses` first to resolve the name to its ID, then pass it in `filters` ' +
@@ -579,6 +597,330 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'search_work_packages',
+    'Smart search for work packages by natural text. Prefer this tool whenever a request asks to search, find, look up, or locate tasks/work packages by title, description, comments, attachments, similar words, or possibly misspelled text. ' +
+      'Never use `list_project_work_packages` for these search-style requests, even when a project is provided; pass `projectId` here to scope the search. ' +
+      'It uses OpenProject\'s `search` filter for server-side full-text candidates, then locally ranks candidates with typo-tolerant fuzzy matching and lightweight related-term matching (for example bug/issue/defect, login/auth/signin, upload/attachment/file). ' +
+      'By default it searches OPEN work packages only; set `includeClosed` to true to search closed tasks too, or pass `statusId` as a numeric ID or status NAME to search one status.',
+    {
+      query: z.string().describe('Text to search for. Supports natural words, phrases, typos, related terms, or a work package ID like "#123"'),
+      projectId: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe('Optional project ID, identifier, or NAME (e.g. "Demo Project") to scope search to one project'),
+      statusId: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe('Optional status ID or status NAME (e.g. "In Progress"). When omitted, open work packages only are searched unless includeClosed is true'),
+      assigneeId: z.number().optional().describe('Optional assignee user ID'),
+      includeClosed: z.boolean().optional().describe('Search closed work packages too when statusId is omitted (default: false)'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_WORK_PACKAGE_SEARCH_LIMIT)
+        .optional()
+        .describe(`Maximum ranked results to return (default 25, max ${MAX_WORK_PACKAGE_SEARCH_LIMIT})`),
+      candidatePageSize: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_WORK_PACKAGE_SEARCH_PAGE_SIZE)
+        .optional()
+        .describe(`Candidate fetch page size for ranking (default 200, max ${MAX_WORK_PACKAGE_SEARCH_PAGE_SIZE})`),
+      maxPages: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_WORK_PACKAGE_SEARCH_MAX_PAGES)
+        .optional()
+        .describe(`Maximum pages to fetch for candidate ranking (default 5, max ${MAX_WORK_PACKAGE_SEARCH_MAX_PAGES})`),
+      sortBy: z.string().optional().describe('Optional OpenProject sort criteria as a JSON array for candidate fetching'),
+    },
+    async ({ query, projectId, statusId, assigneeId, includeClosed, limit, candidatePageSize, maxPages, sortBy }) => {
+      const toolName = 'search_work_packages';
+      const caller = `tool:${toolName}`;
+      const params = { query, projectId, statusId, assigneeId, includeClosed, limit, candidatePageSize, maxPages, sortBy };
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
+      try {
+        const trimmedQuery = query.trim();
+        if (!trimmedQuery) {
+          throw new Error('query must not be empty');
+        }
+
+        const resolvedProject = projectId === undefined ? undefined : await resolveProjectRef(client, projectId);
+        const resolvedStatusId = statusId === undefined ? undefined : await resolveStatusId(client, statusId);
+        const effectiveLimit = clampSearchLimit(limit);
+        const effectivePageSize = clampSearchPageSize(candidatePageSize);
+        const effectiveMaxPages = clampSearchMaxPages(maxPages);
+        const exactWorkPackageId = parseWorkPackageIdQuery(trimmedQuery);
+
+        const baseFilters = buildWorkPackageSearchFilters({
+          statusId: resolvedStatusId,
+          assigneeId,
+          includeClosed,
+          useFullText: false,
+        });
+        const fullTextFilters = buildWorkPackageSearchFilters({
+          query: trimmedQuery,
+          statusId: resolvedStatusId,
+          assigneeId,
+          includeClosed,
+        });
+
+        const [fullTextFetch, broadFetch, exactIdFetch] = await Promise.allSettled([
+          client.listAllWorkPackages({
+            projectId: resolvedProject?.id,
+            filters: fullTextFilters,
+            sortBy,
+            pageSize: effectivePageSize,
+            maxPages: effectiveMaxPages,
+          }),
+          client.listAllWorkPackages({
+            projectId: resolvedProject?.id,
+            filters: baseFilters,
+            sortBy,
+            pageSize: effectivePageSize,
+            maxPages: effectiveMaxPages,
+          }),
+          exactWorkPackageId === null
+            ? Promise.resolve<WorkPackage | null>(null)
+            : client.getWorkPackage(exactWorkPackageId),
+        ] as const);
+
+        if (
+          fullTextFetch.status === 'rejected' &&
+          broadFetch.status === 'rejected' &&
+          (exactWorkPackageId === null || exactIdFetch.status === 'rejected')
+        ) {
+          throw new Error(
+            `Search failed: ${String(fullTextFetch.reason instanceof Error ? fullTextFetch.reason.message : fullTextFetch.reason)}; ` +
+              `fallback failed: ${String(broadFetch.reason instanceof Error ? broadFetch.reason.message : broadFetch.reason)}`
+          );
+        }
+
+        const fullTextWorkPackages = fullTextFetch.status === 'fulfilled' ? fullTextFetch.value.workPackages : [];
+        const broadWorkPackages = broadFetch.status === 'fulfilled' ? broadFetch.value.workPackages : [];
+
+        function workPackageMatchesSearchFilters(workPackage: WorkPackage): boolean {
+          const links = workPackage._links ?? {};
+          if (
+            resolvedProject &&
+            extractResourceId(links.project?.href ?? '', 'projects') !== resolvedProject.id
+          ) {
+            return false;
+          }
+          if (
+            resolvedStatusId !== undefined &&
+            extractResourceId(links.status?.href ?? '', 'statuses') !== resolvedStatusId
+          ) {
+            return false;
+          }
+          if (
+            assigneeId !== undefined &&
+            extractResourceId(links.assignee?.href ?? '', 'users') !== assigneeId
+          ) {
+            return false;
+          }
+          return true;
+        }
+
+        const exactIdWorkPackages =
+          exactIdFetch.status === 'fulfilled' && exactIdFetch.value && workPackageMatchesSearchFilters(exactIdFetch.value)
+            ? [exactIdFetch.value]
+            : [];
+        const serverMatchedIds = new Set(fullTextWorkPackages.map((workPackage) => workPackage.id));
+        const candidates = mergeWorkPackages(exactIdWorkPackages, fullTextWorkPackages, broadWorkPackages);
+        const results = rankWorkPackageSearchResults(candidates, trimmedQuery, {
+          serverMatchedIds,
+          limit: effectiveLimit,
+        });
+
+        const warnings: string[] = [];
+        if (fullTextFetch.status === 'rejected') {
+          warnings.push(
+            `OpenProject full-text search failed: ${
+              fullTextFetch.reason instanceof Error ? fullTextFetch.reason.message : String(fullTextFetch.reason)
+            }`
+          );
+        }
+        if (broadFetch.status === 'rejected') {
+          warnings.push(
+            `Broad fuzzy candidate fetch failed: ${
+              broadFetch.reason instanceof Error ? broadFetch.reason.message : String(broadFetch.reason)
+            }`
+          );
+        }
+        if (exactWorkPackageId !== null && exactIdFetch.status === 'rejected') {
+          warnings.push(
+            `Exact ID lookup for work package ${exactWorkPackageId} failed: ${
+              exactIdFetch.reason instanceof Error ? exactIdFetch.reason.message : String(exactIdFetch.reason)
+            }`
+          );
+        }
+
+        const result = {
+          query: trimmedQuery,
+          filters: {
+            project: resolvedProject ? { id: resolvedProject.id, name: resolvedProject.name ?? null } : null,
+            statusId: resolvedStatusId ?? null,
+            statusRef: statusId ?? null,
+            assigneeId: assigneeId ?? null,
+            openOnly: resolvedStatusId === undefined && includeClosed !== true,
+            includeClosed: includeClosed === true,
+          },
+          search: {
+            mode: 'openproject_full_text_plus_local_fuzzy',
+            semantic: 'lexical aliases only; no embedding service is used',
+            fullTextFilter: fullTextFilters,
+            broadCandidateFilter: baseFilters,
+            warnings,
+          },
+          summary: {
+            returned: results.length,
+            candidatesScored: candidates.length,
+            exactIdCandidates: exactIdWorkPackages.length,
+            fullTextCandidates: fullTextWorkPackages.length,
+            broadCandidates: broadWorkPackages.length,
+            apiReportedTotal: {
+              fullText: fullTextFetch.status === 'fulfilled' ? fullTextFetch.value.total : null,
+              broad: broadFetch.status === 'fulfilled' ? broadFetch.value.total : null,
+            },
+            complete: {
+              fullText:
+                fullTextFetch.status === 'fulfilled'
+                  ? fullTextFetch.value.workPackages.length >= fullTextFetch.value.total
+                  : false,
+              broad:
+                broadFetch.status === 'fulfilled'
+                  ? broadFetch.value.workPackages.length >= broadFetch.value.total
+                  : false,
+            },
+            candidateFetch: {
+              pageSize: effectivePageSize,
+              maxPages: effectiveMaxPages,
+              maxCandidates: effectivePageSize * effectiveMaxPages,
+            },
+          },
+          results,
+        };
+
+        logger.logToolResult(caller, toolName, true, result);
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'semantic_search_project_work_packages',
+    'Project-scoped in-memory semantic-ish search over recently updated work packages. Use this when a request asks to find related or relevant tickets inside a project. ' +
+      'This is the preferred action for project-specific "search", "find", "look for", "related", "similar", or "relevant tickets" requests; never use `list_project_work_packages` for those intents. ' +
+      'The tool fetches only the latest updated project work packages into RAM (default/max 500), requests only ID, subject, description, and updatedAt from OpenProject, builds a local TF-IDF vector index over subject + description, then blends vector similarity with keyword/fuzzy relevance. ' +
+      'No remote embedding service or persistent vector database is used.',
+    {
+      projectId: z
+        .union([z.number(), z.string()])
+        .describe('Project ID, identifier, or NAME (e.g. "Demo Project") to search within'),
+      query: z.string().describe('Natural text, keywords, or a phrase to find related/relevant tickets for'),
+      statusId: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe('Optional status ID or status NAME (e.g. "In Progress"). When omitted, open work packages only are indexed unless includeClosed is true'),
+      assigneeId: z.number().optional().describe('Optional assignee user ID'),
+      includeClosed: z.boolean().optional().describe('Index closed work packages too when statusId is omitted (default: false)'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_WORK_PACKAGE_SEARCH_LIMIT)
+        .optional()
+        .describe(`Maximum ranked results to return (default 25, max ${MAX_WORK_PACKAGE_SEARCH_LIMIT})`),
+      candidateLimit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_PROJECT_MEMORY_CANDIDATE_LIMIT)
+        .optional()
+        .describe(`How many latest-updated project work packages to load into RAM (default/max ${MAX_PROJECT_MEMORY_CANDIDATE_LIMIT})`),
+    },
+    async ({ projectId, query, statusId, assigneeId, includeClosed, limit, candidateLimit }) => {
+      const toolName = 'semantic_search_project_work_packages';
+      const caller = `tool:${toolName}`;
+      const params = { projectId, query, statusId, assigneeId, includeClosed, limit, candidateLimit };
+      logger.logToolInvocation(caller, toolName, params);
+      client.setCaller(caller);
+
+      try {
+        const trimmedQuery = query.trim();
+        if (!trimmedQuery) {
+          throw new Error('query must not be empty');
+        }
+
+        const resolvedProject = await resolveProjectRef(client, projectId);
+        const resolvedStatusId = statusId === undefined ? undefined : await resolveStatusId(client, statusId);
+        const effectiveLimit = clampSearchLimit(limit);
+        const effectiveCandidateLimit = clampProjectMemoryCandidateLimit(candidateLimit);
+        const filters = buildWorkPackageSearchFilters({
+          statusId: resolvedStatusId,
+          assigneeId,
+          includeClosed,
+          useFullText: false,
+        });
+
+        const { workPackages, total } = await client.listAllWorkPackages({
+          projectId: resolvedProject.id,
+          filters,
+          sortBy: PROJECT_MEMORY_SEARCH_SORT_BY,
+          pageSize: effectiveCandidateLimit,
+          maxPages: 1,
+          select: PROJECT_MEMORY_SEARCH_SELECT,
+        });
+        const results = rankProjectMemorySearchResults(workPackages, trimmedQuery, {
+          limit: effectiveLimit,
+        });
+
+        const result = {
+          query: trimmedQuery,
+          filters: {
+            project: { id: resolvedProject.id, name: resolvedProject.name ?? null },
+            statusId: resolvedStatusId ?? null,
+            statusRef: statusId ?? null,
+            assigneeId: assigneeId ?? null,
+            openOnly: resolvedStatusId === undefined && includeClosed !== true,
+            includeClosed: includeClosed === true,
+          },
+          search: {
+            mode: 'local_ram_tfidf_vector_plus_keyword_fuzzy',
+            semantic: 'local lexical vector over subject + description; no embedding API or persistent vector store',
+            candidateWindow: 'latest_updated_project_work_packages',
+            sortBy: PROJECT_MEMORY_SEARCH_SORT_BY,
+            selectedFields: PROJECT_MEMORY_SEARCH_SELECT,
+          },
+          summary: {
+            returned: results.length,
+            candidatesIndexed: workPackages.length,
+            apiReportedTotal: total,
+            complete: workPackages.length >= total,
+            candidateLimit: effectiveCandidateLimit,
+          },
+          results,
+        };
+
+        logger.logToolResult(caller, toolName, true, result);
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
