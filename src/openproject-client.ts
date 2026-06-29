@@ -159,6 +159,18 @@ export interface Activity {
   _links: Record<string, { href: string; title?: string }>;
 }
 
+export interface Attachment {
+  id: number;
+  fileName: string;
+  fileSize: number;
+  description?: { format: string; raw: string; html: string };
+  contentType: string;
+  status: string;
+  digest?: { algorithm: string; hash: string };
+  createdAt: string;
+  _links: Record<string, { href: string; title?: string }>;
+}
+
 export interface OpenProjectError {
   _type: 'Error';
   errorIdentifier: string;
@@ -167,6 +179,68 @@ export interface OpenProjectError {
     details?: {
       attribute?: string;
     };
+  };
+}
+
+export interface OpenProjectMultipartBody {
+  body: Buffer;
+  boundary: string;
+  contentType: string;
+  contentLength: number;
+}
+
+function createMultipartBoundary(): string {
+  return `----tonle-openproject-${crypto.randomUUID()}`;
+}
+
+function escapeMultipartHeaderValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '_');
+}
+
+function assertNoHeaderLineBreaks(value: string, label: string): void {
+  if (/[\r\n]/.test(value)) {
+    throw new Error(`${label} must not contain line breaks`);
+  }
+}
+
+export function buildOpenProjectMultipartBody(
+  fileName: string,
+  content: Uint8Array,
+  contentType?: string,
+  description?: string,
+  options: { boundary?: string } = {}
+): OpenProjectMultipartBody {
+  const boundary = options.boundary ?? createMultipartBoundary();
+  const fileType = contentType || 'application/octet-stream';
+
+  assertNoHeaderLineBreaks(boundary, 'multipart boundary');
+  assertNoHeaderLineBreaks(fileType, 'attachment contentType');
+
+  const metadata: Record<string, unknown> = { fileName };
+  if (description) metadata.description = { raw: description };
+
+  const chunks = [
+    Buffer.from(
+      `--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="metadata"\r\n' +
+        'Content-Type: application/json\r\n\r\n' +
+        `${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${escapeMultipartHeaderValue(fileName)}"\r\n` +
+        `Content-Type: ${fileType}\r\n\r\n`,
+      'utf8'
+    ),
+    Buffer.from(content),
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ];
+
+  const body = Buffer.concat(chunks);
+
+  return {
+    body,
+    boundary,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    contentLength: body.byteLength,
   };
 }
 
@@ -262,8 +336,76 @@ export class OpenProjectClient {
     }
   }
 
+  /**
+   * Upload raw file content using a `multipart/form-data` request, as required
+   * by OpenProject's attachment endpoints. The body is built manually so the
+   * JSON metadata part is not serialized as a file upload with `filename=""`;
+   * the binary content is never logged (only its metadata).
+   */
+  private async uploadMultipart<T>(
+    endpoint: string,
+    fileName: string,
+    content: Uint8Array,
+    contentType?: string,
+    description?: string
+  ): Promise<T> {
+    const url = `${this.config.baseUrl}/api/v3${endpoint}`;
+    const fileType = contentType || 'application/octet-stream';
+    const multipart = buildOpenProjectMultipartBody(fileName, content, fileType, description);
+
+    logger.logApiRequest(this.caller, 'POST', endpoint, undefined, {
+      fileName,
+      contentType: fileType,
+      fileSize: content.byteLength,
+      description,
+    });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.config.timeout);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': this.headers['Authorization'] ?? '',
+          'Accept': 'application/hal+json',
+          'Content-Type': multipart.contentType,
+          'Content-Length': String(multipart.contentLength),
+        } as Record<string, string>,
+        body: multipart.body,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        const error = data as OpenProjectError;
+        const errorMessage = `OpenProject API Error: ${error.message || response.statusText} (${error.errorIdentifier || response.status})`;
+        logger.logApiError(this.caller, 'POST', endpoint, new Error(errorMessage));
+        throw new Error(errorMessage);
+      }
+
+      logger.logApiResponse(this.caller, 'POST', endpoint, response.status, data);
+
+      return data as T;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        const timeoutError = new Error(`Request timeout after ${this.config.timeout}ms`);
+        logger.logApiError(this.caller, 'POST', endpoint, timeoutError);
+        throw timeoutError;
+      }
+      if (error instanceof Error) {
+        logger.logApiError(this.caller, 'POST', endpoint, error);
+      }
+      throw error;
+    }
+  }
+
   // ============== Root & Configuration ==============
-  
+
   async getRoot(): Promise<HALResponse> {
     return this.request('GET', '');
   }
@@ -435,6 +577,39 @@ export class OpenProjectClient {
 
   async listWorkPackageActivities(id: number): Promise<HALResponse<Activity>> {
     return this.request('GET', `/work_packages/${id}/activities`);
+  }
+
+  // ============== Attachments ==============
+
+  /**
+   * Attach a file to a work package. Sends a multipart upload to
+   * `POST /work_packages/{id}/attachments`. The returned attachment's
+   * `/api/v3/attachments/{id}/content` link can be used to embed images inline
+   * in the work package description.
+   */
+  async createWorkPackageAttachment(
+    workPackageId: number,
+    attachment: { fileName: string; content: Uint8Array; contentType?: string; description?: string }
+  ): Promise<Attachment> {
+    return this.uploadMultipart(
+      `/work_packages/${workPackageId}/attachments`,
+      attachment.fileName,
+      attachment.content,
+      attachment.contentType,
+      attachment.description
+    );
+  }
+
+  async listWorkPackageAttachments(workPackageId: number): Promise<HALResponse<Attachment>> {
+    return this.request('GET', `/work_packages/${workPackageId}/attachments`);
+  }
+
+  async getAttachment(id: number): Promise<Attachment> {
+    return this.request('GET', `/attachments/${id}`);
+  }
+
+  async deleteAttachment(id: number): Promise<void> {
+    await this.request('DELETE', `/attachments/${id}`);
   }
 
   // ============== Users ==============
@@ -697,4 +872,3 @@ export function createClient(caller?: string): OpenProjectClient {
     caller: caller || 'system',
   });
 }
-

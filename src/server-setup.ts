@@ -13,7 +13,14 @@ import {
   buildTimeEntryFilters,
   resolvePeriod,
 } from './timesheet.ts';
-import { executeBulkWorkPackageUpdate, updateWithLockRetry, type WorkPackageChanges } from './bulk-update.ts';
+import { executeBulkWorkPackageUpdate, updateWithLockRetry, listChangedFields, type WorkPackageChanges } from './bulk-update.ts';
+import {
+  appendInlineImages,
+  prepareAttachments,
+  uploadPreparedAttachments,
+  type AttachmentInput,
+  type UploadedAttachmentResult,
+} from './attachments.ts';
 import { buildMemberTaskFilters, groupWorkPackagesByProjectMemberStatus } from './member-tasks.ts';
 import {
   DEFAULT_STATUS_TASK_PAGE_SIZE,
@@ -56,6 +63,49 @@ export const descriptionInput = z.preprocess((val) => {
   }
   return val;
 }, z.string().optional());
+
+/**
+ * Per-file attachment input shared by the create/update work package tools.
+ * Each file is provided either by a local `filePath` the server can read or as
+ * `base64` content. Image files are embedded inline in the work package
+ * description by default; every other file type is attached as a normal file.
+ */
+export const attachmentInputSchema = z.object({
+  fileName: z.string().optional().describe('File name including extension (e.g. "diagram.png"). Derived from filePath when omitted; required for base64 content.'),
+  filePath: z.string().optional().describe('Path to a local file the server can read. Provide this OR base64, not both.'),
+  base64: z.string().optional().describe('Base64-encoded file content. Provide this OR filePath, not both.'),
+  contentType: z.string().optional().describe('MIME type (e.g. "image/png"). Auto-detected from the file extension when omitted.'),
+  description: z.string().optional().describe('Optional caption stored on the attachment.'),
+  inline: z.boolean().optional().describe('Embed the file in the description as an inline image. Defaults to true for images, false for other file types.'),
+});
+
+/**
+ * Upload attachments to a work package, then embed any inline images into its
+ * description. Returns the per-file upload results and, when inline images were
+ * added, the work package after its description was patched. The supplied
+ * `baseDescription` is the description to extend (the value just written, or
+ * the work package's current description).
+ */
+export async function attachToWorkPackage(
+  client: OpenProjectClient,
+  workPackageId: number,
+  lockVersion: number,
+  baseDescription: string,
+  attachments: AttachmentInput[],
+  notify?: boolean
+): Promise<{ results: UploadedAttachmentResult[]; workPackage?: WorkPackage }> {
+  const prepared = await prepareAttachments(attachments);
+  const { results, inlineMarkdown } = await uploadPreparedAttachments(client, workPackageId, prepared);
+
+  let workPackage: WorkPackage | undefined;
+  if (inlineMarkdown) {
+    const description = appendInlineImages(baseDescription, inlineMarkdown);
+    const updated = await updateWithLockRetry(client, { id: workPackageId, lockVersion }, { description }, notify);
+    workPackage = updated.workPackage;
+  }
+
+  return { results, workPackage };
+}
 
 export async function resolveProjectId(client: OpenProjectClient, projectRef: number | string): Promise<number> {
   if (typeof projectRef === 'number') {
@@ -718,7 +768,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'create_work_package',
-    'Create a new work package in a project',
+    'Create a new work package in a project. Optionally attach files via "attachments": image files are embedded inline in the description, other file types are attached as normal work package files. Each attachment is provided by a local filePath or base64 content.',
     {
       projectId: z.union([z.number(), z.string()]).describe('Project ID or identifier'),
       subject: z.string().describe('Subject/title of the work package'),
@@ -734,12 +784,13 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       dueDate: z.string().optional().describe('Due date (YYYY-MM-DD)'),
       estimatedTime: z.string().optional().describe('Estimated time (ISO 8601 duration, e.g., PT8H)'),
       percentageDone: z.number().min(0).max(100).optional().describe('Completion percentage (0-100)'),
+      attachments: z.array(attachmentInputSchema).optional().describe('Files to attach. Images are embedded inline in the description; other file types are attached as regular work package files.'),
       notify: z.boolean().optional().describe('Send notifications (default: true)'),
     },
-    async ({ projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify }) => {
+    async ({ projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, attachments, notify }) => {
       const toolName = 'create_work_package';
       const caller = `tool:${toolName}`;
-      logger.logToolInvocation(caller, toolName, { projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify });
+      logger.logToolInvocation(caller, toolName, { projectId, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, attachments: attachments?.length, notify });
       client.setCaller(caller);
 
       try {
@@ -762,9 +813,19 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         };
         if (description) data.description = { raw: description };
 
-        const result = await client.createWorkPackage(projectId, data, notify);
-        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
-        logger.logToolResult(caller, toolName, true, result);
+        let result = await client.createWorkPackage(projectId, data, notify);
+
+        let attachmentResults: UploadedAttachmentResult[] | undefined;
+        if (attachments && attachments.length > 0) {
+          const baseDescription = result.description?.raw ?? description ?? '';
+          const { results, workPackage } = await attachToWorkPackage(client, result.id, result.lockVersion, baseDescription, attachments, notify);
+          attachmentResults = results;
+          if (workPackage) result = workPackage;
+        }
+
+        const payload = attachmentResults ? { workPackage: result, attachments: attachmentResults } : result;
+        const response = { content: [{ type: 'text', text: formatResponse(payload) }] };
+        logger.logToolResult(caller, toolName, true, payload);
         return response;
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
@@ -775,7 +836,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'update_work_package',
-    'Update an existing work package. The current lockVersion is fetched automatically when omitted (preferred); a stale lockVersion (UpdateConflict) is automatically refetched and the update retried once. Pass only the fields you want to change.',
+    'Update an existing work package. The current lockVersion is fetched automatically when omitted (preferred); a stale lockVersion (UpdateConflict) is automatically refetched and the update retried once. Pass only the fields you want to change. Optionally add files via "attachments": image files are embedded inline in the description, other file types are attached as normal work package files. Each attachment is provided by a local filePath or base64 content.',
     {
       id: z.number().describe('Work package ID'),
       lockVersion: z.number().optional().describe('Current lock version (for optimistic locking). Fetched automatically when omitted; a stale version is refetched and the update retried once.'),
@@ -792,12 +853,13 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       dueDate: z.string().optional().describe('New due date (YYYY-MM-DD)'),
       estimatedTime: z.string().optional().describe('New estimated time'),
       percentageDone: z.number().min(0).max(100).optional().describe('New completion percentage'),
+      attachments: z.array(attachmentInputSchema).optional().describe('Files to attach. Images are embedded inline in the description; other file types are attached as regular work package files.'),
       notify: z.boolean().optional().describe('Send notifications'),
     },
-    async ({ id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify }) => {
+    async ({ id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, attachments, notify }) => {
       const toolName = 'update_work_package';
       const caller = `tool:${toolName}`;
-      logger.logToolInvocation(caller, toolName, { id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, notify });
+      logger.logToolInvocation(caller, toolName, { id, lockVersion, subject, description, typeId, statusId, priorityId, assigneeId, responsibleId, versionId, parentId, startDate, dueDate, estimatedTime, percentageDone, attachments: attachments?.length, notify });
       client.setCaller(caller);
 
       try {
@@ -817,9 +879,30 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
           percentageDone,
         };
 
-        const { workPackage: result } = await updateWithLockRetry(client, { id, lockVersion }, changes, notify);
-        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
-        logger.logToolResult(caller, toolName, true, result);
+        // Apply field changes first (when any were given), otherwise read the
+        // current work package so attachments have a fresh lockVersion and
+        // description to extend with inline images.
+        let result: WorkPackage;
+        if (listChangedFields(changes).length > 0) {
+          result = (await updateWithLockRetry(client, { id, lockVersion }, changes, notify)).workPackage;
+        } else if (attachments && attachments.length > 0) {
+          result = await client.getWorkPackage(id);
+        } else {
+          // No changes and no attachments: preserve prior behavior (a no-op PATCH).
+          result = (await updateWithLockRetry(client, { id, lockVersion }, changes, notify)).workPackage;
+        }
+
+        let attachmentResults: UploadedAttachmentResult[] | undefined;
+        if (attachments && attachments.length > 0) {
+          const baseDescription = result.description?.raw ?? '';
+          const { results, workPackage } = await attachToWorkPackage(client, id, result.lockVersion, baseDescription, attachments, notify);
+          attachmentResults = results;
+          if (workPackage) result = workPackage;
+        }
+
+        const payload = attachmentResults ? { workPackage: result, attachments: attachmentResults } : result;
+        const response = { content: [{ type: 'text', text: formatResponse(payload) }] };
+        logger.logToolResult(caller, toolName, true, payload);
         return response;
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
@@ -926,6 +1009,54 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  // ============== Attachment Tools ==============
+
+  server.tool(
+    'list_work_package_attachments',
+    'List the files attached to a work package',
+    {
+      id: z.number().describe('Work package ID'),
+    },
+    async ({ id }) => {
+      const toolName = 'list_work_package_attachments';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
+      try {
+        const result = await client.listWorkPackageAttachments(id);
+        const response = { content: [{ type: 'text', text: formatResponse(result) }] };
+        logger.logToolResult(caller, toolName, true, result);
+        return response;
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'delete_attachment',
+    'Delete an attachment by its ID',
+    {
+      id: z.number().describe('Attachment ID'),
+    },
+    async ({ id }) => {
+      const toolName = 'delete_attachment';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { id });
+      client.setCaller(caller);
+
+      try {
+        await client.deleteAttachment(id);
+        return { content: [{ type: 'text', text: `Attachment ${id} deleted successfully` }] };
       } catch (error) {
         logger.logToolResult(caller, toolName, false, undefined, error as Error);
         return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
