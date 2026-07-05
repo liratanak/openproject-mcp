@@ -8,6 +8,7 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - Parameters marked “JSON” expect a stringified JSON expression, mirroring OpenProject’s filtering/sorting syntax.
 - Resource identifiers accept either numeric IDs or, where noted, string identifiers such as `me`.
 - Dates should be formatted as `YYYY-MM-DD`; durations follow ISO-8601 (e.g., `PT8H30M`).
+- Paged list responses include `agentContinuation` when more items remain. Use its `nextOffset` and `pageSize` to fetch additional pages, but continue for at most 5 pages unless the user asks for more.
 
 ## Tool Catalog
 
@@ -333,7 +334,7 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 #### `list_time_entries`
 
-**Description:** Lists time entries with pagination/filtering.
+**Description:** Lists raw individual time entries with pagination/filtering. Do not use this for summary, total, aggregate, grouped, report, hours-by-member, hours-by-project, or table requests. Use `get_timesheet_total` for timesheet totals and `get_timesheet_summary_table` for member × project summary tables.
 
 **Parameters:**
 - `offset` (number, optional) – Page offset.
@@ -377,6 +378,30 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 
 **Parameters:**
 - `id` (number) – Time entry ID.
+
+#### `get_timesheet_total`
+
+**Description:** Summarizes logged hours over a period. Use this for timesheet summary/total/report requests that do not need a member × project matrix. Never use `list_time_entries` for summaries; it returns raw rows only.
+
+**Parameters:**
+- `user` (number|string, optional) – User ID, `me`, or a partial user name. Omit for all users.
+- `period` (`today`|`yesterday`|`this_week`|`last_week`|`this_month`|`last_month`, optional) – Named period relative to today.
+- `startDate` (string, optional) – Range start date (`YYYY-MM-DD`), used with `endDate`.
+- `endDate` (string, optional) – Range end date (`YYYY-MM-DD`), used with `startDate`.
+- `projectId` (number|string, optional) – Project ID or identifier.
+- `includeEntries` (boolean, optional) – Include normalized raw entries in the response.
+
+#### `get_timesheet_summary_table`
+
+**Description:** Summarizes total logged hours as one member × project markdown table. Use this for prompts like `Summary total hours by members, by projects in 1 table for last month`. It accepts a natural-language `prompt`, a named `period`, or explicit `startDate`/`endDate`. Never use `list_time_entries` for summary/table/report requests.
+
+**Parameters:**
+- `prompt` (string, optional) – Natural-language summary request used to infer the period when date fields are omitted.
+- `period` (`today`|`yesterday`|`this_week`|`last_week`|`this_month`|`last_month`, optional) – Named period relative to today.
+- `startDate` (string, optional) – Range start date (`YYYY-MM-DD`), used with `endDate`.
+- `endDate` (string, optional) – Range end date (`YYYY-MM-DD`), used with `startDate`.
+- `user` (number|string, optional) – User ID, `me`, or a partial user name. Omit for all users.
+- `projectId` (number|string, optional) – Project ID or identifier.
 
 ### Versions
 
@@ -455,7 +480,5 @@ This document summarizes the Model Context Protocol (MCP) tools exposed by `inde
 - `offset` (number, optional) – Page offset.
 - `pageSize` (number, optional) – Items per page.
 - `filters` (string, optional) – JSON filter expression.
-
-
 
 

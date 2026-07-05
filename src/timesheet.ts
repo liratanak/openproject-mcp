@@ -50,6 +50,28 @@ export interface TimesheetAggregation {
   warnings: string[];
 }
 
+export interface TimesheetMatrixRow {
+  member: string;
+  hoursByProject: Record<string, number>;
+  entries: number;
+  totalHours: number;
+}
+
+export interface TimesheetMatrix {
+  members: string[];
+  projects: string[];
+  rows: TimesheetMatrixRow[];
+  projectTotals: Record<string, number>;
+  grandTotal: TimesheetBucket;
+  warnings: string[];
+}
+
+export type TimesheetPeriodInput = {
+  period?: TimesheetPeriodPreset;
+  startDate?: string;
+  endDate?: string;
+};
+
 const DATE_FORMAT_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Durations with years/months are calendar-dependent and never produced by
@@ -87,13 +109,70 @@ function isValidDateString(value: string): boolean {
   return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
 }
 
+const PROMPT_PERIOD_PATTERNS: Array<[TimesheetPeriodPreset, RegExp]> = [
+  ['last_month', /\blast\s+month\b/],
+  ['this_month', /\b(this|current)\s+month\b/],
+  ['last_week', /\blast\s+week\b/],
+  ['this_week', /\b(this|current)\s+week\b/],
+  ['yesterday', /\byesterday\b/],
+  ['today', /\btoday\b/],
+];
+
+/**
+ * Infer a timesheet date range from a natural-language prompt. This is
+ * deliberately deterministic and small: it supports the named period presets
+ * exposed by the MCP tools plus explicit YYYY-MM-DD start/end pairs.
+ */
+export function parseTimesheetPrompt(prompt: string): TimesheetPeriodInput {
+  const trimmed = prompt.trim();
+  if (trimmed === '') {
+    throw new Error('Prompt must not be empty; include a period like "last month" or explicit YYYY-MM-DD dates');
+  }
+
+  const dateMatches = [...trimmed.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)].map((match) => match[0]);
+  if (dateMatches.length >= 2) {
+    return { startDate: dateMatches[0], endDate: dateMatches[1] };
+  }
+  if (dateMatches.length === 1) {
+    throw new Error('Prompt contains only one YYYY-MM-DD date; include both start and end dates');
+  }
+
+  const normalized = trimmed.toLowerCase().replace(/[_-]+/g, ' ');
+  const matches = PROMPT_PERIOD_PATTERNS.filter(([, pattern]) => pattern.test(normalized)).map(([period]) => period);
+
+  if (matches.length === 1) {
+    return { period: matches[0] };
+  }
+  if (matches.length > 1) {
+    throw new Error(`Prompt contains multiple time periods (${matches.join(', ')}); use one period or explicit dates`);
+  }
+
+  throw new Error(
+    'Could not infer a timesheet period from prompt; include today, yesterday, this week, last week, this month, last month, or explicit YYYY-MM-DD start/end dates'
+  );
+}
+
+export function resolveTimesheetPeriodInput(options: TimesheetPeriodInput & { prompt?: string }): TimesheetPeriodInput {
+  if (options.period !== undefined || options.startDate !== undefined || options.endDate !== undefined) {
+    const periodInput: TimesheetPeriodInput = {};
+    if (options.period !== undefined) periodInput.period = options.period;
+    if (options.startDate !== undefined) periodInput.startDate = options.startDate;
+    if (options.endDate !== undefined) periodInput.endDate = options.endDate;
+    return periodInput;
+  }
+  if (options.prompt !== undefined) {
+    return parseTimesheetPrompt(options.prompt);
+  }
+  return {};
+}
+
 /**
  * Resolve a named period preset or an explicit date range into inclusive
  * YYYY-MM-DD boundaries. Presets are evaluated against the local timezone
  * of the machine running the server (the business timezone).
  */
 export function resolvePeriod(
-  options: { period?: TimesheetPeriodPreset; startDate?: string; endDate?: string },
+  options: TimesheetPeriodInput,
   now: Date = new Date()
 ): ResolvedPeriod {
   const { period, startDate, endDate } = options;
@@ -226,6 +305,123 @@ function toSortedBreakdown<K extends string>(
     .map(([key, bucket]) => ({ [keyName]: key, entries: bucket.entries, hours: roundHours(bucket.hours) }) as Record<K, string> & TimesheetBucket);
 }
 
+function timeEntryMemberLabel(entry: TimeEntry): string {
+  const links = entry._links ?? {};
+  const userId = extractIdFromHref(links.user?.href, 'users');
+  return links.user?.title ?? (userId !== null ? `User #${userId}` : 'Unknown user');
+}
+
+function timeEntryProjectLabel(entry: TimeEntry): string {
+  return entry._links?.project?.title ?? 'Unknown project';
+}
+
+/**
+ * Cross-tabulate raw OpenProject time entries into a member × project hours
+ * matrix: one row per member, one column per project, with per-member totals,
+ * per-project totals and a grand total. Hours are summed from the exact
+ * durations and only rounded (2 decimals) in the output. Rows are sorted by
+ * total hours (highest first, ties by name), columns alphabetically.
+ */
+export function buildTimesheetMatrix(timeEntries: TimeEntry[]): TimesheetMatrix {
+  const warnings: string[] = [];
+  const cells = new Map<string, Map<string, TimesheetBucket>>();
+  const projectSet = new Set<string>();
+  let grandEntries = 0;
+  let grandHours = 0;
+
+  for (const entry of timeEntries) {
+    const exactHours = isoDurationToHours(entry.hours);
+    if (exactHours === null) {
+      warnings.push(
+        `Time entry ${entry.id} has a missing or unparsable hours value (${JSON.stringify(entry.hours ?? null)}); counted as 0`
+      );
+    }
+    const hours = exactHours ?? 0;
+    const member = timeEntryMemberLabel(entry);
+    const project = timeEntryProjectLabel(entry);
+
+    projectSet.add(project);
+    const memberCells = cells.get(member) ?? new Map<string, TimesheetBucket>();
+    accumulate(memberCells, project, hours);
+    cells.set(member, memberCells);
+    grandEntries += 1;
+    grandHours += hours;
+  }
+
+  const projects = [...projectSet].sort((a, b) => a.localeCompare(b));
+
+  const unsortedRows = [...cells.entries()].map(([member, memberCells]) => {
+    let exactTotal = 0;
+    let entries = 0;
+    const hoursByProject: Record<string, number> = {};
+    for (const project of projects) {
+      const bucket = memberCells.get(project);
+      if (!bucket) continue;
+      hoursByProject[project] = roundHours(bucket.hours);
+      exactTotal += bucket.hours;
+      entries += bucket.entries;
+    }
+    return { member, hoursByProject, entries, exactTotal };
+  });
+
+  unsortedRows.sort((a, b) => b.exactTotal - a.exactTotal || a.member.localeCompare(b.member));
+  const rows: TimesheetMatrixRow[] = unsortedRows.map(({ member, hoursByProject, entries, exactTotal }) => ({
+    member,
+    hoursByProject,
+    entries,
+    totalHours: roundHours(exactTotal),
+  }));
+
+  const projectTotals: Record<string, number> = {};
+  for (const project of projects) {
+    let exactTotal = 0;
+    for (const memberCells of cells.values()) {
+      exactTotal += memberCells.get(project)?.hours ?? 0;
+    }
+    projectTotals[project] = roundHours(exactTotal);
+  }
+
+  return {
+    members: rows.map((row) => row.member),
+    projects,
+    rows,
+    projectTotals,
+    grandTotal: { entries: grandEntries, hours: roundHours(grandHours) },
+    warnings,
+  };
+}
+
+function escapeMarkdownCell(value: string): string {
+  return value.replace(/\|/g, '\\|');
+}
+
+/**
+ * Render a timesheet matrix as a single GitHub-flavored markdown table:
+ * members as rows, projects as columns, a Total column per member and a
+ * final Total row per project. Cells without logged time show "-".
+ */
+export function renderTimesheetMatrixMarkdown(matrix: TimesheetMatrix): string {
+  if (matrix.rows.length === 0) {
+    return 'No time entries found for this period.';
+  }
+
+  const header = ['Member', ...matrix.projects.map(escapeMarkdownCell), 'Total'];
+  const separator = ['---', ...matrix.projects.map(() => '---:'), '---:'];
+  const lines = [`| ${header.join(' | ')} |`, `| ${separator.join(' | ')} |`];
+
+  for (const row of matrix.rows) {
+    const cells = matrix.projects.map((project) =>
+      project in row.hoursByProject ? String(row.hoursByProject[project]) : '-'
+    );
+    lines.push(`| ${escapeMarkdownCell(row.member)} | ${cells.join(' | ')} | ${row.totalHours} |`);
+  }
+
+  const totalCells = matrix.projects.map((project) => `**${matrix.projectTotals[project] ?? 0}**`);
+  lines.push(`| **Total** | ${totalCells.join(' | ')} | **${matrix.grandTotal.hours}** |`);
+
+  return lines.join('\n');
+}
+
 /**
  * Aggregate raw OpenProject time entries into totals plus per-user,
  * per-project and per-date breakdowns. Hours are summed from the exact
@@ -243,12 +439,11 @@ export function aggregateTimeEntries(timeEntries: TimeEntry[]): TimesheetAggrega
       );
     }
 
-    const userId = extractIdFromHref(links.user?.href, 'users');
     const row: NormalizedTimeEntry = {
       entry_id: entry.id,
       spent_on: entry.spentOn,
-      user: links.user?.title ?? (userId !== null ? `User #${userId}` : 'Unknown user'),
-      project: links.project?.title ?? 'Unknown project',
+      user: timeEntryMemberLabel(entry),
+      project: timeEntryProjectLabel(entry),
       work_package_id: extractIdFromHref(links.workPackage?.href, 'work_packages'),
       work_package: links.workPackage?.title ?? '',
       activity: links.activity?.title ?? '',

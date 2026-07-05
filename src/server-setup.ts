@@ -11,7 +11,11 @@ import {
   TIMESHEET_PERIOD_PRESETS,
   aggregateTimeEntries,
   buildTimeEntryFilters,
+  buildTimesheetMatrix,
+  renderTimesheetMatrixMarkdown,
   resolvePeriod,
+  resolveTimesheetPeriodInput,
+  type ResolvedPeriod,
 } from './timesheet.ts';
 import { executeBulkWorkPackageUpdate, updateWithLockRetry, listChangedFields, type WorkPackageChanges } from './bulk-update.ts';
 import {
@@ -62,6 +66,98 @@ export function formatResponse(data: unknown): string {
 // Helper to create API links
 export function createLink(type: string, id: number | string): string {
   return `/api/v3/${type}/${id}`;
+}
+
+export const MAX_AGENT_CONTINUATION_PAGES = 5;
+
+export interface AgentPaginationContinuation {
+  hasMore: true;
+  message: string;
+  currentOffset: number;
+  nextOffset: number;
+  pageSize: number;
+  returned: number;
+  total: number;
+  remainingItemsEstimate: number;
+  maxAdditionalPages: number;
+  suggestedOffsets: number[];
+}
+
+interface PaginationInputs {
+  offset?: number;
+  pageSize?: number;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function collectionElementCount(collection: Record<string, unknown>): number | undefined {
+  const embedded = collection._embedded as { elements?: unknown } | undefined;
+  if (Array.isArray(embedded?.elements)) return embedded.elements.length;
+  if (Array.isArray(collection.elements)) return collection.elements.length;
+  return undefined;
+}
+
+/**
+ * Build agent-facing continuation guidance for OpenProject paged list results.
+ * OpenProject offsets are used by this server as 1-based page numbers, so the
+ * next page is `offset + 1`. Suggestions are capped at 5 pages to prevent an
+ * agent from fetching an unbounded list without another user decision.
+ */
+export function buildAgentPaginationContinuation(
+  toolName: string,
+  collection: unknown,
+  inputs: PaginationInputs = {}
+): AgentPaginationContinuation | undefined {
+  if (typeof collection !== 'object' || collection === null) return undefined;
+
+  const page = collection as Record<string, unknown>;
+  const total = asFiniteNumber(page.total);
+  const rawOffset = asFiniteNumber(page.offset) ?? inputs.offset;
+  const rawPageSize = asFiniteNumber(page.pageSize) ?? inputs.pageSize;
+  const returned = asFiniteNumber(page.count) ?? collectionElementCount(page);
+
+  if (total === undefined || rawOffset === undefined || rawPageSize === undefined || returned === undefined) {
+    return undefined;
+  }
+  if (total <= 0 || rawPageSize <= 0 || returned <= 0) return undefined;
+
+  const currentOffset = Math.max(1, Math.trunc(rawOffset));
+  const pageSize = Math.trunc(rawPageSize);
+  const fetchedThrough = currentOffset * pageSize;
+  if (fetchedThrough >= total) return undefined;
+
+  const remainingItemsEstimate = Math.max(0, total - fetchedThrough);
+  const remainingPagesEstimate = Math.ceil(remainingItemsEstimate / pageSize);
+  const suggestedPageCount = Math.min(MAX_AGENT_CONTINUATION_PAGES, remainingPagesEstimate);
+  const suggestedOffsets = Array.from({ length: suggestedPageCount }, (_, index) => currentOffset + index + 1);
+  const nextOffset = suggestedOffsets[0]!;
+
+  return {
+    hasMore: true,
+    message:
+      `More items are available. To continue, call ${toolName} with offset=${nextOffset} and pageSize=${pageSize}. ` +
+      `Continue for at most ${MAX_AGENT_CONTINUATION_PAGES} additional pages unless the user asks for more.`,
+    currentOffset,
+    nextOffset,
+    pageSize,
+    returned: Math.trunc(returned),
+    total: Math.trunc(total),
+    remainingItemsEstimate: Math.trunc(remainingItemsEstimate),
+    maxAdditionalPages: MAX_AGENT_CONTINUATION_PAGES,
+    suggestedOffsets,
+  };
+}
+
+export function addAgentPaginationContinuation<T>(
+  toolName: string,
+  collection: T,
+  inputs: PaginationInputs = {}
+): T {
+  const agentContinuation = buildAgentPaginationContinuation(toolName, collection, inputs);
+  if (!agentContinuation || typeof collection !== 'object' || collection === null) return collection;
+  return { ...(collection as Record<string, unknown>), agentContinuation } as T;
 }
 
 /**
@@ -279,6 +375,42 @@ export async function resolveTimesheetUser(
   return { id: match.id, name: match.name };
 }
 
+/**
+ * Fetch all time entries for an already-resolved period (optionally scoped to
+ * one user and/or project) and cross-tabulate them into a member × project
+ * hours matrix plus a ready-to-display markdown table. Shared by
+ * get_timesheet_summary_table and list_work_packages_by_status (period mode).
+ */
+export async function fetchTimesheetSummaryTable(
+  client: OpenProjectClient,
+  options: {
+    period: ResolvedPeriod;
+    userId?: number;
+    projectId?: number;
+  }
+) {
+  const filters = buildTimeEntryFilters({
+    startDate: options.period.startDate,
+    endDate: options.period.endDate,
+    userId: options.userId,
+    projectId: options.projectId,
+  });
+  const { entries, total } = await client.listAllTimeEntries({ filters });
+  const matrix = buildTimesheetMatrix(entries);
+
+  return {
+    period: options.period,
+    table: renderTimesheetMatrixMarkdown(matrix),
+    matrix,
+    validation: {
+      apiReportedTotal: total,
+      entriesFetched: entries.length,
+      complete: entries.length >= total,
+    },
+    warnings: matrix.warnings.length > 0 ? matrix.warnings : undefined,
+  };
+}
+
 // Helper to wrap tool handlers with logging
 function wrapToolHandler<T extends z.ZodTypeAny>(
   client: OpenProjectClient,
@@ -387,7 +519,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listProjects(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listProjects(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -555,7 +687,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         const effectiveParams = params.filters === undefined && params.query_id === undefined
           ? { ...params, filters: buildStatusWorkPackageFilters({}) }
           : params;
-        const result = await client.listWorkPackages(effectiveParams);
+        const result = addAgentPaginationContinuation(toolName, await client.listWorkPackages(effectiveParams), effectiveParams);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -593,7 +725,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         const effectiveParams = params.filters === undefined && params.query_id === undefined
           ? { ...params, filters: buildStatusWorkPackageFilters({}) }
           : params;
-        const result = await client.listProjectWorkPackages(projectId, effectiveParams);
+        const result = addAgentPaginationContinuation(toolName, await client.listProjectWorkPackages(projectId, effectiveParams), effectiveParams);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -934,7 +1066,8 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       'Optionally scope to a project (`projectId`) and/or an assignee (`assigneeId`). Task listing defaults to page 1 with 100 records per page unless `offset` or `pageSize` is provided. ' +
       'If `statusId` is omitted, only OPEN work packages are summarized and listed by status name (closed tasks are excluded by default; pass a closed status explicitly when needed). ' +
       'NOTE: for requests that group/list tasks BY or PER member (e.g. "In Progress tasks grouped by each member", "... by team members"), prefer the `list_member_tasks` tool — it returns a Project -> Member -> Status -> tasks tree and does the per-member grouping for you. ' +
-      'Use this tool for a flat single-status listing, optionally narrowed to one assignee via `assigneeId`.',
+      'Use this tool for a flat single-status listing, optionally narrowed to one assignee via `assigneeId`. ' +
+      'TIME-ENTRY SUMMARY PROMPTS: prompts that summarize time entries / logged hours within a duration (e.g. "Summary total hours by members, by projects in 1 table for last month") take PRIORITY routing to `get_timesheet_summary_table`; never use `list_time_entries` for summary/table/report requests. This tool also supports them: pass `period` (or `startDate`+`endDate`) and the response includes the same combined member × project logged-hours markdown table under `timesheet` (scoped by `projectId`/`assigneeId` when given, independent of status).',
     {
       statusId: z.union([z.number(), z.string()]).optional().describe('Status ID or status NAME (e.g. "In Progress", "New"). Resolved automatically when a name is given. Omit to list open work packages grouped by status.'),
       projectId: z.union([z.number(), z.string()]).optional().describe('Optional project ID or identifier to scope the listing to one project'),
@@ -942,14 +1075,19 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       offset: z.number().optional().describe('Page offset for pagination (defaults to 1)'),
       pageSize: z.number().optional().describe('Number of tasks to list per page (defaults to 100)'),
       sortBy: z.string().optional().describe('Sort criteria as JSON array'),
+      period: z.enum(TIMESHEET_PERIOD_PRESETS).optional().describe('Optional named time range (e.g. "last_month") to ALSO summarize logged hours as a member × project table in `timesheet`. Use either this or startDate+endDate'),
+      startDate: z.string().optional().describe('Timesheet range start date (YYYY-MM-DD, inclusive); use together with endDate instead of period'),
+      endDate: z.string().optional().describe('Timesheet range end date (YYYY-MM-DD, inclusive); use together with startDate instead of period'),
     },
-    async ({ statusId, projectId, assigneeId, offset, pageSize, sortBy }) => {
+    async ({ statusId, projectId, assigneeId, offset, pageSize, sortBy, period, startDate, endDate }) => {
       const toolName = 'list_work_packages_by_status';
       const caller = `tool:${toolName}`;
-      logger.logToolInvocation(caller, toolName, { statusId, projectId, assigneeId, offset, pageSize, sortBy });
+      logger.logToolInvocation(caller, toolName, { statusId, projectId, assigneeId, offset, pageSize, sortBy, period, startDate, endDate });
       client.setCaller(caller);
 
       try {
+        const wantsTimesheet = period !== undefined || startDate !== undefined || endDate !== undefined;
+        const timesheetPeriod = wantsTimesheet ? resolvePeriod({ period, startDate, endDate }) : undefined;
         const resolvedStatusId = statusId === undefined ? undefined : await resolveStatusId(client, statusId);
         const filters = buildStatusWorkPackageFilters({ statusId: resolvedStatusId, assigneeId });
         const effectiveOffset = offset ?? 1;
@@ -978,6 +1116,19 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
                 count: pageTotal,
               },
             ];
+        const timesheet = timesheetPeriod
+          ? await fetchTimesheetSummaryTable(client, {
+              period: timesheetPeriod,
+              userId: assigneeId,
+              projectId: projectId === undefined ? undefined : await resolveProjectId(client, projectId),
+            })
+          : undefined;
+        const agentContinuation = buildAgentPaginationContinuation(
+          toolName,
+          { total: pageTotal, count: page.count ?? tasks.length, offset: responseOffset, pageSize: responsePageSize },
+          { offset: effectiveOffset, pageSize: effectivePageSize }
+        );
+
         const groupedResult = {
           filters: {
             statusId: resolvedStatusId ?? null,
@@ -986,6 +1137,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
             projectId: projectId ?? null,
             assigneeId: assigneeId ?? null,
           },
+          timesheet,
           summary: {
             total: resolvedStatusId === undefined ? allForSummary?.total ?? 0 : pageTotal,
             returned: tasks.length,
@@ -1001,6 +1153,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
             total: pageTotal,
             hasMore,
           },
+          agentContinuation,
           tasks,
           groupedByStatus: groupStatusTasks(tasks),
         };
@@ -1347,7 +1500,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listWorkPackageActivities(id);
+        const result = addAgentPaginationContinuation(toolName, await client.listWorkPackageActivities(id));
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1373,7 +1526,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listWorkPackageAttachments(id);
+        const result = addAgentPaginationContinuation(toolName, await client.listWorkPackageAttachments(id));
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1432,7 +1585,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
           };
         }
 
-        const result = await client.listUsers(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listUsers(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1635,7 +1788,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listMemberships(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listMemberships(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1663,7 +1816,11 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       try {
         const resolvedProjectId = await resolveProjectId(client, projectId);
         const filters = buildProjectMembershipFilter(resolvedProjectId);
-        const result = await client.listMemberships({ offset, pageSize, filters });
+        const result = addAgentPaginationContinuation(
+          toolName,
+          await client.listMemberships({ offset, pageSize, filters }),
+          { offset, pageSize }
+        );
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1701,12 +1858,15 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
         }
 
         const filters = buildProjectMembershipFilter(projectId);
-        const memberships = await client.listMemberships({ offset, pageSize, filters });
+        const rawMemberships = await client.listMemberships({ offset, pageSize, filters });
+        const agentContinuation = buildAgentPaginationContinuation(toolName, rawMemberships, { offset, pageSize });
+        const memberships = addAgentPaginationContinuation(toolName, rawMemberships, { offset, pageSize });
         const response = {
           workPackageId,
           projectId,
           projectHref,
           memberships,
+          agentContinuation,
         };
         return { content: [{ type: 'text', text: formatResponse(response) }] };
       } catch (error) {
@@ -1729,7 +1889,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listTypes();
+        const result = addAgentPaginationContinuation(toolName, await client.listTypes());
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1777,7 +1937,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listProjectTypes(projectId);
+        const result = addAgentPaginationContinuation(toolName, await client.listProjectTypes(projectId));
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1805,7 +1965,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listStatuses();
+        const result = addAgentPaginationContinuation(toolName, await client.listStatuses());
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1853,7 +2013,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listPriorities();
+        const result = addAgentPaginationContinuation(toolName, await client.listPriorities());
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -1892,7 +2052,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'list_time_entries',
-    'List all time entries',
+    'List raw individual time entries only. Do NOT use this tool for any summary, total, aggregate, grouped, report, hours-by-member, hours-by-project, or table request. For summaries/totals use `get_timesheet_total`; for one member × project summary table prompts such as "Summary total hours by members, by projects in 1 table for last month", use `get_timesheet_summary_table`.',
     {
       offset: z.number().optional().describe('Page offset for pagination'),
       pageSize: z.number().optional().describe('Number of items per page'),
@@ -1906,7 +2066,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listTimeEntries(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listTimeEntries(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -2040,7 +2200,8 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
 
   server.tool(
     'get_timesheet_total',
-    'Get timesheet totals (logged hours) for a specific user or the whole team over a time range. Accepts a named period (today, yesterday, this_week, last_week, this_month, last_month; weeks start on Monday, local timezone) or an exact startDate/endDate range. Fetches all matching time entries across pages and returns total entries/hours plus per-user, per-project and per-date breakdowns with hours as decimal numbers (e.g. PT7H30M = 7.5)',
+    'Get timesheet totals (logged hours) for a specific user or the whole team over a time range. Accepts a named period (today, yesterday, this_week, last_week, this_month, last_month; weeks start on Monday, local timezone) or an exact startDate/endDate range. Fetches all matching time entries across pages and returns total entries/hours plus per-user, per-project and per-date breakdowns with hours as decimal numbers (e.g. PT7H30M = 7.5). ' +
+      'Use this for summary/total/report requests that do not need a member × project matrix; never use `list_time_entries` for summaries because it returns raw rows only. NOTE: when the request wants hours grouped by members AND by projects combined in ONE table (a cross-table / matrix, e.g. "Summary total hours by members, by projects in 1 table for last month"), use `get_timesheet_summary_table` instead — it returns that single combined table directly.',
     {
       user: z.union([z.number(), z.string()]).optional().describe('User ID, "me" for the authenticated user, or a (partial) user name to look up. Omit to include all users (team totals)'),
       period: z.enum(TIMESHEET_PERIOD_PRESETS).optional().describe('Named time range relative to today. Use either this or startDate+endDate'),
@@ -2096,6 +2257,56 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
     }
   );
 
+  server.tool(
+    'get_timesheet_summary_table',
+    'Summarize total logged hours (time entries) as ONE combined member × project cross-table over a duration. ' +
+      'PRIORITY ROUTING: any prompt that summarizes time entries / logged hours / timesheet totals WITHIN a duration or period — e.g. "Summary total hours by members, by projects in 1 table for last month" or "hours per member per project this week" — should come HERE first, with priority over list_work_packages_by_status, list_member_tasks and get_timesheet_total (those return tasks or separate one-dimensional breakdowns, not the combined table). ' +
+      'Never use `list_time_entries` for summary/table/report requests; it returns raw rows only. Accepts either a natural-language `prompt` (e.g. "Summary total hours by members, by projects in 1 table for last month"), a named period (today, yesterday, this_week, last_week, this_month, last_month; weeks start on Monday, local timezone), or an exact startDate/endDate range. ' +
+      'Returns `table` — a ready-to-display GitHub-flavored markdown table with members as rows, projects as columns, a Total column per member, a Total row per project and a grand total — plus the structured `matrix` (rows sorted by total hours descending) with hours as decimal numbers (e.g. PT7H30M = 7.5).',
+    {
+      prompt: z.string().optional().describe('Natural-language summary request. Example: "Summary total hours by members, by projects in 1 table for last month". Used to infer the period when period/startDate/endDate are omitted'),
+      period: z.enum(TIMESHEET_PERIOD_PRESETS).optional().describe('Named time range relative to today (e.g. "last_month"). Use either this or startDate+endDate'),
+      startDate: z.string().optional().describe('Range start date (YYYY-MM-DD, inclusive); required together with endDate when period is not set'),
+      endDate: z.string().optional().describe('Range end date (YYYY-MM-DD, inclusive); required together with startDate when period is not set'),
+      user: z.union([z.number(), z.string()]).optional().describe('Optional user ID, "me", or (partial) user name to limit the table to one member. Omit for the whole team'),
+      projectId: z.union([z.number(), z.string()]).optional().describe('Optional project ID or identifier to limit the table to one project'),
+    },
+    async ({ prompt, period, startDate, endDate, user, projectId }) => {
+      const toolName = 'get_timesheet_summary_table';
+      const caller = `tool:${toolName}`;
+      logger.logToolInvocation(caller, toolName, { prompt, period, startDate, endDate, user, projectId });
+      client.setCaller(caller);
+
+      try {
+        const resolvedPeriod = resolvePeriod(resolveTimesheetPeriodInput({ prompt, period, startDate, endDate }));
+        const resolvedUser = user === undefined ? undefined : await resolveTimesheetUser(client, user);
+        const resolvedProjectId = projectId === undefined ? undefined : await resolveProjectId(client, projectId);
+
+        const summary = await fetchTimesheetSummaryTable(client, {
+          period: resolvedPeriod,
+          userId: resolvedUser?.id,
+          projectId: resolvedProjectId,
+        });
+
+        const result = {
+          period: summary.period,
+          user: resolvedUser ?? 'all',
+          projectId: resolvedProjectId,
+          table: summary.table,
+          matrix: summary.matrix,
+          validation: summary.validation,
+          warnings: summary.warnings,
+        };
+
+        logger.logToolResult(caller, toolName, true, result);
+        return { content: [{ type: 'text', text: formatResponse(result) }] };
+      } catch (error) {
+        logger.logToolResult(caller, toolName, false, undefined, error as Error);
+        return { content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+    }
+  );
+
   // ============== Version Tools ==============
 
   server.tool(
@@ -2113,7 +2324,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listVersions(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listVersions(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -2161,7 +2372,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listProjectVersions(projectId);
+        const result = addAgentPaginationContinuation(toolName, await client.listProjectVersions(projectId));
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;
@@ -2318,7 +2529,7 @@ export function setupMcpServer(config: ServerConfig = {}): { server: McpServer; 
       client.setCaller(caller);
 
       try {
-        const result = await client.listPrincipals(params);
+        const result = addAgentPaginationContinuation(toolName, await client.listPrincipals(params), params);
         const response = { content: [{ type: 'text', text: formatResponse(result) }] };
         logger.logToolResult(caller, toolName, true, result);
         return response;

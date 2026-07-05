@@ -81,6 +81,7 @@ Once connected, you can ask your AI assistant to:
 - "Update work package #123 to status 'In Progress'"
 - "Move #45, #46 and #47 to the next sprint and assign them all to Bob" (bulk update in one call)
 - "How many hours did Vanntha log last month?" (timesheet totals per user, project and day)
+- "Summary total hours by members, by projects in 1 table for last month" (timesheet member × project summary table)
 - And much more...
 
 ## Documentation

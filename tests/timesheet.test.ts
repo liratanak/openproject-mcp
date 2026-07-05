@@ -8,8 +8,12 @@ import type { TimeEntry } from '../src/openproject-client.ts';
 import {
   aggregateTimeEntries,
   buildTimeEntryFilters,
+  buildTimesheetMatrix,
   isoDurationToHours,
+  parseTimesheetPrompt,
+  renderTimesheetMatrixMarkdown,
   resolvePeriod,
+  resolveTimesheetPeriodInput,
   roundHours,
 } from '../src/timesheet.ts';
 
@@ -145,6 +149,51 @@ describe('resolvePeriod', () => {
   });
 });
 
+describe('parseTimesheetPrompt', () => {
+  test('infers last_month from the summary table prompt', () => {
+    expect(parseTimesheetPrompt('Summary total hours by members, by projects in 1 table for last month')).toEqual({
+      period: 'last_month',
+    });
+  });
+
+  test('infers supported named periods from natural language', () => {
+    expect(parseTimesheetPrompt('hours per member per project this week')).toEqual({ period: 'this_week' });
+    expect(parseTimesheetPrompt('timesheet report for current month')).toEqual({ period: 'this_month' });
+    expect(parseTimesheetPrompt('logged hours yesterday')).toEqual({ period: 'yesterday' });
+  });
+
+  test('infers an explicit date range from YYYY-MM-DD dates', () => {
+    expect(parseTimesheetPrompt('summary from 2026-05-01 to 2026-05-31')).toEqual({
+      startDate: '2026-05-01',
+      endDate: '2026-05-31',
+    });
+  });
+
+  test('rejects prompts without a usable period', () => {
+    expect(() => parseTimesheetPrompt('summary total hours by members and projects')).toThrow('Could not infer');
+    expect(() => parseTimesheetPrompt('summary for 2026-05-01')).toThrow('only one YYYY-MM-DD date');
+  });
+});
+
+describe('resolveTimesheetPeriodInput', () => {
+  test('uses explicit structured input before prompt inference', () => {
+    expect(
+      resolveTimesheetPeriodInput({
+        prompt: 'Summary total hours by members, by projects in 1 table for last month',
+        period: 'this_week',
+      })
+    ).toEqual({ period: 'this_week' });
+  });
+
+  test('falls back to prompt inference when no date fields are provided', () => {
+    expect(
+      resolveTimesheetPeriodInput({
+        prompt: 'Summary total hours by members, by projects in 1 table for last month',
+      })
+    ).toEqual({ period: 'last_month' });
+  });
+});
+
 describe('buildTimeEntryFilters', () => {
   test('builds an inclusive spentOn range filter', () => {
     const filters = JSON.parse(buildTimeEntryFilters({ startDate: '2026-05-01', endDate: '2026-05-31' }));
@@ -276,5 +325,171 @@ describe('aggregateTimeEntries', () => {
     const result = aggregateTimeEntries(entries);
     expect(result.totals.hours).toBe(0.3);
     expect(result.byUser[0]?.hours).toBe(0.3);
+  });
+});
+
+describe('buildTimesheetMatrix', () => {
+  test('returns an empty matrix for no entries', () => {
+    const matrix = buildTimesheetMatrix([]);
+    expect(matrix.members).toEqual([]);
+    expect(matrix.projects).toEqual([]);
+    expect(matrix.rows).toEqual([]);
+    expect(matrix.projectTotals).toEqual({});
+    expect(matrix.grandTotal).toEqual({ entries: 0, hours: 0 });
+    expect(matrix.warnings).toEqual([]);
+  });
+
+  test('cross-tabulates hours by member and project with totals', () => {
+    const entries: TimeEntry[] = [
+      makeEntry({
+        id: 11,
+        hours: 'PT8H',
+        _links: {
+          user: { href: '/api/v3/users/9', title: 'Vanntha Eng' },
+          project: { href: '/api/v3/projects/3', title: 'Kardal Development' },
+        },
+      }),
+      makeEntry({
+        id: 12,
+        hours: 'PT7H30M',
+        _links: {
+          user: { href: '/api/v3/users/9', title: 'Vanntha Eng' },
+          project: { href: '/api/v3/projects/8', title: 'POS Acquiring' },
+        },
+      }),
+      makeEntry({
+        id: 10,
+        hours: 'PT2H15M',
+        _links: {
+          user: { href: '/api/v3/users/4', title: 'Tona Song' },
+          project: { href: '/api/v3/projects/3', title: 'Kardal Development' },
+        },
+      }),
+      makeEntry({
+        id: 13,
+        hours: 'not-a-duration',
+        _links: {
+          user: { href: '/api/v3/users/7' }, // no title -> falls back to User #7
+        },
+      }),
+    ];
+
+    const matrix = buildTimesheetMatrix(entries);
+
+    // Columns are alphabetical, rows sorted by total hours descending.
+    expect(matrix.projects).toEqual(['Kardal Development', 'POS Acquiring', 'Unknown project']);
+    expect(matrix.members).toEqual(['Vanntha Eng', 'Tona Song', 'User #7']);
+
+    expect(matrix.rows).toEqual([
+      {
+        member: 'Vanntha Eng',
+        hoursByProject: { 'Kardal Development': 8, 'POS Acquiring': 7.5 },
+        entries: 2,
+        totalHours: 15.5,
+      },
+      {
+        member: 'Tona Song',
+        hoursByProject: { 'Kardal Development': 2.25 },
+        entries: 1,
+        totalHours: 2.25,
+      },
+      {
+        member: 'User #7',
+        hoursByProject: { 'Unknown project': 0 },
+        entries: 1,
+        totalHours: 0,
+      },
+    ]);
+
+    expect(matrix.projectTotals).toEqual({
+      'Kardal Development': 10.25,
+      'POS Acquiring': 7.5,
+      'Unknown project': 0,
+    });
+    expect(matrix.grandTotal).toEqual({ entries: 4, hours: 17.75 });
+
+    expect(matrix.warnings).toHaveLength(1);
+    expect(matrix.warnings[0]).toContain('13');
+  });
+
+  test('sums exact durations per cell without floating point noise', () => {
+    const entries = [1, 2, 3].map((id) =>
+      makeEntry({
+        id,
+        hours: 'PT6M',
+        _links: {
+          user: { href: '/api/v3/users/1', title: 'A' },
+          project: { href: '/api/v3/projects/1', title: 'P' },
+        },
+      })
+    );
+    const matrix = buildTimesheetMatrix(entries);
+    expect(matrix.rows[0]?.hoursByProject['P']).toBe(0.3);
+    expect(matrix.rows[0]?.totalHours).toBe(0.3);
+    expect(matrix.projectTotals['P']).toBe(0.3);
+    expect(matrix.grandTotal.hours).toBe(0.3);
+  });
+});
+
+describe('renderTimesheetMatrixMarkdown', () => {
+  test('renders a message when there are no rows', () => {
+    const table = renderTimesheetMatrixMarkdown(buildTimesheetMatrix([]));
+    expect(table).toBe('No time entries found for this period.');
+  });
+
+  test('renders one markdown table with member rows, project columns and totals', () => {
+    const entries: TimeEntry[] = [
+      makeEntry({
+        id: 1,
+        hours: 'PT8H',
+        _links: {
+          user: { href: '/api/v3/users/9', title: 'Vanntha Eng' },
+          project: { href: '/api/v3/projects/3', title: 'Kardal Development' },
+        },
+      }),
+      makeEntry({
+        id: 2,
+        hours: 'PT7H30M',
+        _links: {
+          user: { href: '/api/v3/users/9', title: 'Vanntha Eng' },
+          project: { href: '/api/v3/projects/8', title: 'POS Acquiring' },
+        },
+      }),
+      makeEntry({
+        id: 3,
+        hours: 'PT2H15M',
+        _links: {
+          user: { href: '/api/v3/users/4', title: 'Tona Song' },
+          project: { href: '/api/v3/projects/3', title: 'Kardal Development' },
+        },
+      }),
+    ];
+
+    const table = renderTimesheetMatrixMarkdown(buildTimesheetMatrix(entries));
+    const lines = table.split('\n');
+
+    expect(lines[0]).toBe('| Member | Kardal Development | POS Acquiring | Total |');
+    expect(lines[1]).toBe('| --- | ---: | ---: | ---: |');
+    expect(lines[2]).toBe('| Vanntha Eng | 8 | 7.5 | 15.5 |');
+    // Cells with no logged time show "-"
+    expect(lines[3]).toBe('| Tona Song | 2.25 | - | 2.25 |');
+    expect(lines[4]).toBe('| **Total** | **10.25** | **7.5** | **17.75** |');
+    expect(lines).toHaveLength(5);
+  });
+
+  test('escapes pipe characters in member and project names', () => {
+    const entries: TimeEntry[] = [
+      makeEntry({
+        id: 1,
+        hours: 'PT1H',
+        _links: {
+          user: { href: '/api/v3/users/1', title: 'A|B' },
+          project: { href: '/api/v3/projects/1', title: 'P|Q' },
+        },
+      }),
+    ];
+    const table = renderTimesheetMatrixMarkdown(buildTimesheetMatrix(entries));
+    expect(table).toContain('A\\|B');
+    expect(table).toContain('P\\|Q');
   });
 });

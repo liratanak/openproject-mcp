@@ -60,9 +60,15 @@ describe('list_work_packages_by_status tool', () => {
     expect(Object.keys(properties)).toContain('offset');
     expect(Object.keys(properties)).toContain('pageSize');
 
+    // Optional timesheet-summary params (member × project hours table).
+    expect(Object.keys(properties)).toContain('period');
+    expect(Object.keys(properties)).toContain('startDate');
+    expect(Object.keys(properties)).toContain('endDate');
+
     // statusId is no longer required.
     const required = schema?.required ?? [];
     expect(required).not.toContain('statusId');
+    expect(required ?? []).not.toContain('period');
   });
 
   test('passes validation WITHOUT a statusId (no longer a "Required" error)', async () => {
@@ -96,5 +102,32 @@ describe('list_work_packages_by_status tool', () => {
     // Validation passes; only the network fetch fails.
     expect(result.text).not.toContain('Invalid arguments');
     expect(result.text).not.toContain('statusId');
+  });
+
+  test('accepts a timesheet period for the member × project hours table', async () => {
+    // "Summary total hours by members, by projects in 1 table for last month"
+    // → period validation passes and the call proceeds to the network layer.
+    const result = await callTool('list_work_packages_by_status', { period: 'last_month' });
+
+    expect(result.text).not.toContain('Invalid arguments');
+    expect(result.text).not.toContain('period');
+  });
+
+  test('rejects a timesheet period combined with explicit dates (fail-fast)', async () => {
+    const result = await callTool('list_work_packages_by_status', {
+      period: 'last_month',
+      startDate: '2026-05-01',
+      endDate: '2026-05-31',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('not both');
+  });
+
+  test('rejects a timesheet startDate without an endDate (fail-fast)', async () => {
+    const result = await callTool('list_work_packages_by_status', { startDate: '2026-05-01' });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('both "startDate" and "endDate"');
   });
 });
